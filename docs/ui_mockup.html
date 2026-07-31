@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Infinite Forms</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0E1710;
+    --panel: #15221A;
+    --panel-2: #1C2B21;
+    --line: #2B3E30;
+    --brass: #C4A253;
+    --brass-dim: #8C7238;
+    --teal: #6FAE8E;
+    --text: #E7E3D3;
+    --text-dim: #8A9384;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 16px;
+    background: radial-gradient(ellipse at top, #17241B 0%, #0A100C 70%);
+    font-family: 'Playfair Display', Georgia, serif;
+    display: flex;
+    justify-content: center;
+  }
+  .device {
+    width: 100%;
+    max-width: 920px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    overflow: hidden;
+  }
+  .header {
+    position: relative;
+    padding: 28px 24px 20px;
+    text-align: center;
+    background: linear-gradient(180deg, #182619 0%, #10190F 100%);
+    border-bottom: 1px solid var(--line);
+  }
+  .compass { position: absolute; top: 22px; left: 24px; width: 30px; height: 30px; opacity: 0.85; }
+  .wordmark {
+    font-weight: 700;
+    font-size: 30px;
+    letter-spacing: 0.12em;
+    color: var(--brass);
+    margin: 0;
+  }
+  .tagline {
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-top: 6px;
+  }
+  .controlbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .iconbtn {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .iconbtn:hover { border-color: var(--brass-dim); color: var(--brass); }
+
+  .content { padding: 26px 24px 4px; }
+
+  .actions {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  .action-card {
+    aspect-ratio: 1.25 / 1;
+    background: radial-gradient(circle at 50% 28%, #262210 0%, var(--panel-2) 72%);
+    border: 1px solid var(--brass-dim);
+    border-radius: 10px;
+    padding: 14px 12px;
+    text-align: center;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    transition: border-color .15s, transform .1s;
+  }
+  .action-card:hover { border-color: var(--brass); transform: translateY(-1px); }
+  .action-card .label {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.45;
+    color: var(--brass);
+  }
+  .action-card.placeholder {
+    background: none;
+    border: 1px dashed var(--line);
+    cursor: default;
+  }
+  .action-card.placeholder:hover { border-color: var(--line); transform: none; }
+  .action-card.placeholder .label { color: var(--text-dim); font-weight: 500; }
+  .action-card.placeholder .ring { border-color: var(--line); color: var(--text-dim); }
+  .ring {
+    width: 54px; height: 54px;
+    border-radius: 50%;
+    border: 2px solid var(--brass);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--brass);
+    flex-shrink: 0;
+  }
+
+  .backbtn {
+    background: none; border: none; color: var(--text-dim); font-size: 13px;
+    font-family: inherit;
+    cursor: pointer; padding: 4px 0; margin-bottom: 16px;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .backbtn:hover { color: var(--brass); }
+  .view-title {
+    font-size: 18px; font-weight: 600; color: var(--brass);
+    margin: 0 0 18px;
+  }
+  .field { margin-bottom: 16px; }
+  .field-label {
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-dim); display: block; margin-bottom: 7px;
+  }
+  .text-input {
+    width: 100%; background: var(--ink); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 9px 12px;
+    font-size: 14px; font-family: inherit;
+  }
+  .text-input:focus { border-color: var(--brass-dim); outline: none; }
+  .filebtn {
+    background: var(--ink); border: 1px solid var(--brass-dim); color: var(--brass);
+    padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer;
+    font-family: inherit;
+  }
+  .filebtn:hover { background: #131F16; }
+  .filename { font-size: 13px; color: var(--text-dim); }
+  .run-btn {
+    width: 100%; background: var(--brass); color: #14200F; border: none;
+    padding: 13px; border-radius: 8px; font-size: 15px; font-weight: 600;
+    font-family: inherit; letter-spacing: 0.03em; cursor: pointer;
+    margin: 6px 0 4px;
+  }
+  .run-btn:hover { background: #D3AD5C; }
+  .inline-row { display: flex; gap: 8px; align-items: stretch; }
+  .minibtn {
+    background: none; border: 1px solid var(--line); color: var(--text-dim);
+    width: 38px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    flex-shrink: 0;
+  }
+  .minibtn:hover { border-color: var(--brass-dim); color: var(--brass); }
+  .check-row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .check {
+    font-size: 14px; color: var(--text); display: inline-flex;
+    align-items: center; gap: 7px; cursor: pointer;
+  }
+  .check input { accent-color: var(--brass); width: 15px; height: 15px; cursor: pointer; }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(5, 10, 6, 0.72);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    width: min(420px, calc(100vw - 48px));
+    background: var(--panel); border: 1px solid var(--brass-dim);
+    border-radius: 12px; padding: 22px;
+    box-shadow: 0 24px 70px rgba(0,0,0,0.6);
+  }
+  .modal-title { font-size: 17px; font-weight: 600; color: var(--brass); margin: 0 0 8px; }
+  .modal-sub { font-size: 13px; color: var(--text-dim); margin: 0 0 16px; line-height: 1.5; }
+  .modal-row { display: flex; gap: 10px; margin-top: 18px; }
+  .modal-row .run-btn { margin: 0; }
+  .ghost-btn {
+    width: 100%; background: none; color: var(--text-dim);
+    border: 1px solid var(--line); padding: 13px; border-radius: 8px;
+    font-size: 15px; font-family: inherit; cursor: pointer;
+  }
+  .ghost-btn:hover { border-color: var(--brass-dim); color: var(--brass); }
+  .progress-track {
+    height: 10px; background: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; overflow: hidden; margin: 14px 0 8px;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: var(--brass);
+    border-radius: 6px; transition: width .12s linear;
+  }
+  .progress-count { font-size: 13px; color: var(--text); text-align: center; }
+
+  .logwrap { padding: 18px 24px 24px; }
+  #logbox {
+    height: 130px;
+    overflow-y: auto;
+    background: #0B140D;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11.5px;
+    line-height: 1.7;
+    color: #B7AE86;
+  }
+  #logbox .dim { color: #545038; }
+  #logbox .ok { color: var(--teal); }
+  #logbox .done { color: var(--brass); font-weight: 600; }
+
+  @media (max-width: 380px) {
+    .actions { grid-template-columns: 1fr; }
+    .action-card { aspect-ratio: auto; padding: 22px 12px; }
+  }
+</style>
+</head>
+<body>
+  <div class="device">
+    <div class="header">
+      <svg class="compass" viewBox="0 0 40 40">
+        <circle cx="20" cy="20" r="17" fill="none" stroke="#C4A253" stroke-width="1"/>
+        <path d="M20 6 L24 20 L20 34 L16 20 Z" fill="#C4A253" opacity="0.9"/>
+        <path d="M6 20 L20 16 L34 20 L20 24 Z" fill="#8C7238" opacity="0.7"/>
+        <circle cx="20" cy="20" r="2" fill="#0B140D"/>
+      </svg>
+      <div class="wordmark">INFINITE FORMS</div>
+      <div class="tagline">Tools to work smarter, not harder</div>
+    </div>
+
+    <div class="controlbar">
+      <div style="display:flex; gap:6px; margin-left:auto;">
+        <button class="iconbtn" title="Reset all dropdowns" onclick="resetDropdowns()">&#8635;</button>
+        <button class="iconbtn" title="Return to dashboard" onclick="showDashboard()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11 L12 4 L20 11"/><path d="M6 10 V20 H18 V10"/></svg></button>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <div class="view" id="dashboardView">
+        <div class="actions">
+
+          <div class="action-card" onclick="showView('audioView')">
+            <div class="ring"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18 V5 L20 3 V16"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/></svg></div>
+            <div class="label">Replace<br>Camera Audio</div>
+          </div>
+
+          <div class="action-card" onclick="showView('assembleView')">
+            <div class="ring"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="17" width="6.5" height="4.5" rx="0.6"/><rect x="8" y="16.5" width="6.5" height="4.5" rx="0.6"/><rect x="15" y="17" width="7" height="4.5" rx="0.6"/><rect x="4" y="12" width="6.5" height="4.5" rx="0.6"/><rect x="12" y="12" width="7" height="4.5" rx="0.6"/><rect x="8" y="3" width="8" height="4.5" rx="0.6" transform="rotate(-18 12 5.25)"/></svg></div>
+            <div class="label">Mid/Short<br>Form Assembly</div>
+          </div>
+
+          <div class="action-card" onclick="ltConfirmOpen()">
+            <div class="ring"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 20 Q10 10 18 4"/><path d="M6 20 Q14 14 18 4"/><path d="M9 15 L13 12 M11 11 L15 8"/><circle cx="5" cy="21" r="0.9" fill="currentColor" stroke="none"/></svg></div>
+            <div class="label">Auto<br>Lower Thirds</div>
+          </div>
+
+          <div class="action-card" onclick="showView('colourView')">
+            <div class="ring"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 C7 3 3 7 3 12 C3 17 7 21 11 21 C13 21 13.5 19.8 13 18.5 C12.4 17 13.3 15.5 15 15.5 L17.5 15.5 C19.5 15.5 21 14 21 12 C21 7 17 3 12 3 Z"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/><circle cx="13" cy="7" r="1.1" fill="currentColor" stroke="none"/><circle cx="17" cy="10" r="1.1" fill="currentColor" stroke="none"/><circle cx="7.5" cy="14" r="1.1" fill="currentColor" stroke="none"/></svg></div>
+            <div class="label">Colour<br>Grading Prep</div>
+          </div>
+
+          <div class="action-card" onclick="runRenameTracks()">
+            <div class="ring"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="13" height="4" rx="1"/><rect x="6" y="10" width="15" height="4" rx="1"/><rect x="3" y="16" width="10" height="4" rx="1"/></svg></div>
+            <div class="label">Rename Video<br>&amp; Audio Tracks</div>
+          </div>
+
+          <div class="action-card" onclick="runSortShootNotes()">
+            <div class="ring"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5 H10 L12 7 H20 V19 H4 Z"/><path d="M8 12 H16 M8 15 H13"/></svg></div>
+            <div class="label">Sort by<br>Shoot Notes</div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="view" id="assembleView" style="display:none;">
+        <button class="backbtn" onclick="showDashboard()">&#8592; Back to dashboard</button>
+        <div class="view-title">Mid/Short Form Assembly</div>
+
+        <div class="field">
+          <label class="field-label">Script</label>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <label for="scriptFile" class="filebtn">Choose file</label>
+            <input type="file" id="scriptFile" accept=".docx,.pdf,.xlsx" style="display:none" onchange="document.getElementById('scriptFileName').textContent = this.files.length ? this.files[0].name : 'No file selected';">
+            <span id="scriptFileName" class="filename">No file selected</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Asset package timeline</label>
+          <select class="text-input" id="assetPackage" onchange="updateNamePlaceholder()">
+            <option>Lisbon &mdash; Clip Asset Package</option>
+            <option>Lisbon &mdash; Long Form</option>
+            <option>London &mdash; Clip Asset Package</option>
+            <option>Porto &mdash; Clip Asset Package</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Form</label>
+          <select class="text-input" id="formType" onchange="updateNamePlaceholder()">
+            <option>Long Form</option>
+            <option selected>Mid Form</option>
+            <option>Short Form</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label class="field-label">New timeline name</label>
+          <input type="text" class="text-input" id="newTimelineName" placeholder="Lisbon - Mid Form Assembly">
+        </div>
+
+        <div class="field">
+          <label class="field-label">Gap between groups</label>
+          <select class="text-input" id="gapSelect">
+            <option value="5">5 seconds</option>
+            <option value="15" selected>15 seconds</option>
+            <option value="30">30 seconds</option>
+          </select>
+        </div>
+
+        <button class="run-btn" onclick="runAssembly()">Run assembly</button>
+      </div>
+
+      <div class="view" id="audioView" style="display:none;">
+        <button class="backbtn" onclick="showDashboard()">&#8592; Back to dashboard</button>
+        <div class="view-title">Replace Camera Audio</div>
+
+        <div class="field">
+          <label class="field-label">Timeline</label>
+          <select class="text-input" id="audioTimeline">
+            <option>Lisbon &mdash; Clip Asset Package</option>
+            <option>Lisbon &mdash; Long Form</option>
+            <option>Amsterdam &mdash; Mid Form Assembly</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Video layers to replace (pick one or more)</label>
+          <div class="check-row">
+            <label class="check"><input type="checkbox" id="audioV1" checked> V1 &mdash; VIDEO A</label>
+            <label class="check"><input type="checkbox" id="audioV2"> V2 &mdash; VIDEO B</label>
+            <label class="check"><input type="checkbox" id="audioV3"> V3 &mdash; GRAPHICS</label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Output to audio layer</label>
+          <select class="text-input" id="audioOut">
+            <option selected>A1 &mdash; CAM AUDIO</option>
+            <option>A2 &mdash; MUSIC 1</option>
+            <option>A3 &mdash; MUSIC 2</option>
+            <option>A4 &mdash; TEMP VO</option>
+            <option>A5 &mdash; HUMAN VO</option>
+            <option>A6 &mdash; SFX 1</option>
+            <option>A7 &mdash; SFX 2</option>
+            <option>A8 &mdash; MASTER</option>
+            <option>New track &mdash; CAM RESTORE (mono)</option>
+          </select>
+        </div>
+
+        <button class="run-btn" onclick="runAudioReplace()">Replace Camera Audio</button>
+      </div>
+
+      <div class="view" id="colourView" style="display:none;">
+        <button class="backbtn" onclick="showDashboard()">&#8592; Back to dashboard</button>
+        <div class="view-title">Colour Grading Prep</div>
+
+        <div class="field">
+          <label class="field-label">Timeline</label>
+          <div class="inline-row">
+            <select class="text-input" id="colorTimeline">
+              <option>Lisbon &mdash; Clip Asset Package</option>
+              <option>Lisbon &mdash; Long Form</option>
+              <option>Amsterdam &mdash; Mid Form Assembly</option>
+            </select>
+            <button class="minibtn" onclick="addLog('Timeline list refreshed.')" title="Refresh timelines">&#8635;</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Client</label>
+          <select class="text-input" id="colorClient">
+            <option>EXPEDIA</option>
+            <option>SKYSCANNER</option>
+          </select>
+        </div>
+
+        <button class="run-btn" onclick="runClientColor()">Run Colour Grading Prep</button>
+      </div>
+
+    </div>
+
+    <div class="logwrap">
+      <div id="logbox">Ready.</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="ltConfirmModal">
+    <div class="modal">
+      <div class="modal-title">Auto Lower Thirds</div>
+      <p class="modal-sub">This will stamp a lower third above every clip on the chosen timeline. It can take a while and modifies the timeline &mdash; confirm before running.</p>
+      <div class="field" style="margin-bottom:0;">
+        <label class="field-label">Timeline</label>
+        <select class="text-input" id="ltTimeline">
+          <option>Lisbon &mdash; Clip Asset Package</option>
+          <option>Lisbon &mdash; Long Form</option>
+          <option>Amsterdam &mdash; Mid Form Assembly</option>
+        </select>
+      </div>
+      <div class="modal-row">
+        <button class="ghost-btn" onclick="ltConfirmClose()">Cancel</button>
+        <button class="run-btn" onclick="ltRun()">Run</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="ltProgressModal">
+    <div class="modal">
+      <div class="modal-title">Auto Lower Thirds</div>
+      <p class="modal-sub" id="ltProgressLabel">Preparing&hellip;</p>
+      <div class="progress-track"><div class="progress-fill" id="ltProgressFill"></div></div>
+      <div class="progress-count" id="ltProgressCount">0 / 0</div>
+      <div class="modal-row">
+        <button class="ghost-btn" onclick="ltStop()">Stop</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+function addLog(line) {
+  var box = document.getElementById('logbox');
+  box.innerHTML += '<br>' + line;
+  box.scrollTop = box.scrollHeight;
+}
+var allViews = ['dashboardView', 'audioView', 'assembleView', 'colourView'];
+function showView(id) {
+  allViews.forEach(function(v) {
+    document.getElementById(v).style.display = (v === id) ? 'block' : 'none';
+  });
+  if (id === 'assembleView') updateNamePlaceholder();
+}
+function showDashboard() {
+  showView('dashboardView');
+}
+function runAudioReplace() {
+  var tl = document.getElementById('audioTimeline').value;
+  var layers = [];
+  if (document.getElementById('audioV1').checked) layers.push('V1');
+  if (document.getElementById('audioV2').checked) layers.push('V2');
+  if (document.getElementById('audioV3').checked) layers.push('V3');
+  var out = document.getElementById('audioOut').value;
+  if (!layers.length) {
+    addLog('<span class="dim">Pick at least one video layer to replace.</span>');
+    return;
+  }
+  addLog('Replacing camera audio on ' + layers.join(', ') + ' of "' + tl + '"...');
+  setTimeout(function(){ addLog('Found 9 clip(s) across ' + layers.join(', ') + '.'); }, 400);
+  setTimeout(function(){ addLog('&nbsp;&nbsp;Restored: A013_0402 (2 skipped, already linked)'); }, 900);
+  setTimeout(function(){ addLog('&nbsp;&nbsp;Restored: A014_0416'); }, 1300);
+  setTimeout(function(){ addLog('<span class="done">Done. Restored 7, skipped 2, failed 0. Audio landed on ' + out + '.</span>'); }, 1900);
+}
+function updateNamePlaceholder() {
+  var pkg = document.getElementById('assetPackage').value.split(' ')[0];
+  var form = document.getElementById('formType').value;
+  document.getElementById('newTimelineName').placeholder = pkg + ' - ' + form + ' Assembly';
+}
+function resetDropdowns() {
+  document.getElementById('assetPackage').selectedIndex = 0;
+  document.getElementById('formType').selectedIndex = 1;
+  document.getElementById('gapSelect').selectedIndex = 1;
+  document.getElementById('colorTimeline').selectedIndex = 0;
+  document.getElementById('colorClient').selectedIndex = 0;
+  document.getElementById('audioTimeline').selectedIndex = 0;
+  document.getElementById('audioOut').selectedIndex = 0;
+  document.getElementById('audioV1').checked = true;
+  document.getElementById('audioV2').checked = false;
+  document.getElementById('audioV3').checked = false;
+  updateNamePlaceholder();
+  addLog('Dropdowns reset to defaults.');
+}
+function runAssembly() {
+  var fileEl = document.getElementById('scriptFile');
+  var scriptName = fileEl.files.length ? fileEl.files[0].name : 'no script selected';
+  var pkg = document.getElementById('assetPackage').value;
+  var form = document.getElementById('formType').value;
+  var nameInput = document.getElementById('newTimelineName');
+  var newName = nameInput.value.trim() || nameInput.placeholder;
+  var gap = document.getElementById('gapSelect').value;
+
+  addLog('Reading <b>' + scriptName + '</b> against <b>' + pkg + '</b>...');
+  setTimeout(function(){ addLog('<span class="ok">Matched 14 clips across 3 locations.</span>'); }, 400);
+  setTimeout(function(){ addLog('Building "' + newName + '" (' + form + ') with ' + gap + 's gaps...'); }, 900);
+  setTimeout(function(){ addLog('<span class="ok">Applying timeline settings: Rec.709-A / DaVinci WG Intermediate.</span>'); }, 1300);
+  setTimeout(function(){ addLog('&nbsp;&nbsp;-&gt; lower third: Belem'); }, 1800);
+  setTimeout(function(){ addLog('&nbsp;&nbsp;-&gt; lower third: Alfama'); }, 2200);
+  setTimeout(function(){ addLog('&nbsp;&nbsp;-&gt; lower third: Sintra day trip'); }, 2600);
+  setTimeout(function(){ addLog('<span class="done">Done. New timeline: "' + newName + '"</span>'); }, 3100);
+}
+function runClientColor() {
+  var tl = document.getElementById('colorTimeline').value;
+  var client = document.getElementById('colorClient').value;
+  var group = client === 'EXPEDIA' ? 'CRM - Expedia' : 'CRM - Skyscanner';
+  addLog('Applying ' + client + ' colour setup to "' + tl + '"...');
+  setTimeout(function(){ addLog('<span class="ok">Using existing colour group \'' + group + '\' (pre/post grades already on it will apply).</span>'); }, 400);
+  setTimeout(function(){ addLog('Assigned 14 clip(s) to \'' + group + '\' (3 titles skipped).'); }, 900);
+  setTimeout(function(){ addLog('<span class="dim">No .drx configured for ' + client + ' -- skipped clip-grade step.</span>'); }, 1300);
+  setTimeout(function(){ addLog('Checking timeline settings...'); }, 1700);
+  setTimeout(function(){ addLog('<span class="done">' + client + ' colour setup done.</span>'); }, 2200);
+}
+function runSortShootNotes() {
+  addLog('Shoot notes parsed: destination "London", 5 themes, 26 POIs.');
+  var lines = [
+    'Theme 1 - History [Blue]:',
+    '&nbsp;&nbsp;Buckingham palace -&gt; POI 1.4 - Buckingham Palace (exact)',
+    '&nbsp;&nbsp;Canary wharf, Docklands, Docklands museum -&gt; POI 1.5',
+    'Theme 2 - Parks [Cyan]:',
+    '&nbsp;&nbsp;Greenwhich -&gt; POI 2.5 - Greenwich Park (fuzzy)',
+    '&nbsp;&nbsp;Kew Gardens -&gt; POI 2.4 - Kew Gardens (exact)',
+    'Theme 5 - Food and drink [Orange]:',
+    '&nbsp;&nbsp;China town -&gt; POI 5.5 - Chinatown (exact)',
+    'EXTRAS: Cable car, Camden, General'
+  ];
+  lines.forEach(function(line, i) {
+    setTimeout(function(){ addLog(line); }, 300 + i * 220);
+  });
+  setTimeout(function(){ addLog('<span class="done">Sort done. Moved 14 folders, coloured 412 clips.</span>'); }, 300 + lines.length * 220 + 400);
+}
+function runRenameTracks() {
+  addLog('Applying standard track layout...');
+  var renames = ['V1: Video 1 -&gt; VIDEO A', 'V2: Video 2 -&gt; VIDEO B', 'V3: Video 3 -&gt; GRAPHICS',
+                 'A1: Audio 1 -&gt; CAM AUDIO', 'A2: Audio 2 -&gt; MUSIC 1', 'A3: Audio 3 -&gt; MUSIC 2',
+                 'A4: Audio 4 -&gt; TEMP VO', 'A5: (created) -&gt; HUMAN VO', 'A6: (created) -&gt; SFX 1',
+                 'A7: (created) -&gt; SFX 2', 'A8: (created) -&gt; MASTER'];
+  renames.forEach(function(line, i) {
+    setTimeout(function(){ addLog('&nbsp;&nbsp;' + line); }, 300 + i * 180);
+  });
+  setTimeout(function(){ addLog('<span class="done">Track layout done. Renamed 7, created 4, failed 0.</span>'); }, 300 + renames.length * 180 + 300);
+}
+
+var ltJob = null;
+var ltLabels = ['Belem', 'Alfama', 'Sintra day trip', 'Baixa', 'Chiado', 'LX Factory', 'Belem Tower', 'Time Out Market', 'Alfama Viewpoint', 'Tram 28', 'Cais do Sodre', 'Principe Real'];
+function ltConfirmOpen() {
+  document.getElementById('ltConfirmModal').classList.add('open');
+}
+function ltConfirmClose() {
+  document.getElementById('ltConfirmModal').classList.remove('open');
+}
+function ltRun() {
+  var tl = document.getElementById('ltTimeline').value;
+  ltConfirmClose();
+  var total = ltLabels.length;
+  var done = 0;
+  document.getElementById('ltProgressModal').classList.add('open');
+  document.getElementById('ltProgressLabel').innerHTML = 'Stamping lower thirds on "' + tl + '"&hellip;';
+  document.getElementById('ltProgressFill').style.width = '0%';
+  document.getElementById('ltProgressCount').textContent = '0 / ' + total;
+  addLog('Auto Lower Thirds running on "' + tl + '" (' + total + ' clips)...');
+  ltJob = setInterval(function() {
+    done++;
+    addLog('&nbsp;&nbsp;-&gt; ' + ltLabels[done - 1]);
+    document.getElementById('ltProgressFill').style.width = Math.round(done / total * 100) + '%';
+    document.getElementById('ltProgressCount').textContent = done + ' / ' + total;
+    if (done >= total) {
+      clearInterval(ltJob); ltJob = null;
+      document.getElementById('ltProgressModal').classList.remove('open');
+      addLog('<span class="done">Lower thirds done. Created ' + total + ', updated 0, skipped 0, failed 0.</span>');
+    }
+  }, 420);
+}
+function ltStop() {
+  if (ltJob) { clearInterval(ltJob); ltJob = null; }
+  var done = document.getElementById('ltProgressCount').textContent.split(' / ')[0];
+  document.getElementById('ltProgressModal').classList.remove('open');
+  addLog('<span class="dim">Stopped after ' + done + ' clip(s). Already-stamped titles are kept.</span>');
+}
+</script>
+</body>
+</html>
