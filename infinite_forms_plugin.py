@@ -1754,6 +1754,35 @@ def is_audio_clip(media_pool_item):
     return False
 
 
+def group_neighbourhood(entry_cids, clip_folder_map):
+    """The neighbourhood a group's clips live in: the (N)-marked ancestor
+    folder that most of the group's clips share. Returns the folder name
+    with the (N) suffix stripped, or None when the clips have no (N)
+    ancestor."""
+    counts = {}
+    for cid in entry_cids:
+        for folder in (clip_folder_map.get(cid) or []):
+            stripped = folder.strip()
+            if stripped.lower().endswith("(n)"):
+                name = stripped[:-3].strip()
+                counts[name] = counts.get(name, 0) + 1
+                break
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def lower_third_label(script_label, neighbourhood):
+    """'POI NAME - NEIGHBOURHOOD', except when that would duplicate --
+    if the script label already IS (or contains) the neighbourhood, the
+    label stands alone."""
+    if not neighbourhood:
+        return script_label
+    if _sort_norm(neighbourhood) in _sort_norm(script_label):
+        return script_label
+    return f"{script_label} - {neighbourhood}"
+
+
 def clip_frames(media_pool_item):
     try:
         return int(media_pool_item.GetClipProperty("Frames") or 0)
@@ -1993,8 +2022,11 @@ def run_assembly(project, media_pool, params):
                 log(f"  Failed to append extra: {mpi.GetName()}")
 
         if group_frames > 0 and template_clip:
+            nei = group_neighbourhood(
+                [e["cid"] for e in entries] + list(extras), clip_folder_map)
+            lt_text = lower_third_label(label, nei)
             ok = apply_lower_third(media_pool, existing_titles, template_clip,
-                                    label, group_start, group_frames,
+                                    lt_text, group_start, group_frames,
                                     LT_TITLE_VIDEO_TRACK)
             log(f"  -> lower third: {label}" + ("" if ok else " (failed)"))
 
