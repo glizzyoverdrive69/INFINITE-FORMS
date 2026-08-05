@@ -12,7 +12,7 @@ assembled timelines out).
 | Tool | What it does |
 |---|---|
 | **Auto Lower Thirds** | Reads clips across V1–V4 and stamps a templated Text+ lower third for each on V5, labelled from the clip's location bin |
-| **Bin Finder** | Instant ranked search across every bin (and optionally every file name) in the Media Pool — jump anywhere in two keystrokes. Pinnable, collapsible |
+| **Bin Finder** | Instant ranked search across every bin (and optionally every file name) in the Media Pool — jump anywhere in two keystrokes. Fuzzy and multi-word queries (`ep3 aud`, `bkgm` → Buckingham Palace), search as you type, Enter to open, and it switches to the Edit page so the jump is actually visible from Colour or Fairlight. Pinnable, with a compact mode that is just a search bar until you type, then expands to show results |
 | **Colour Grading Prep** | Assigns every clip on a timeline to the right client colour group and verifies timeline format/colour settings |
 | **Mid/Short Form Assembly** | Parses a writer's script (.docx), matches its locations against the Media Pool, and assembles a new timeline: approved Clip Asset Package clips (exact trims + grades) grouped per script location, with per-group lower thirds. Two versions: **Lisa** (package + remainder of each location's bins) and **Maggie** (package clips only). Unused package clips land together at the end |
 | **Rename Video & Audio Tracks** | Applies the standard track layout (VIDEO A/B, GRAPHICS, CAM AUDIO, MUSIC 1/2, TEMP VO, HUMAN VO, SFX 1/2, MASTER) in one click |
@@ -33,21 +33,33 @@ to their parent POI.
 
 ## Installation
 
-See **[INSTALL.md](INSTALL.md)** for the full fresh-machine guide,
-including the per-project assets each feature expects and a
-troubleshooting table.
+**Double-click `One Click Install Infinite Forms.command`.** It checks
+every dependency (and tells you which ones are fatal versus which just
+cost you a feature), validates the plugin file, copies it and the docx
+helper into Resolve's Scripts folder, backs up any previous install, and
+installs `python-docx` into whichever Python Resolve is using. Then
+restart Resolve and launch **infinite_forms_plugin** from
+Workspace > Scripts > Utility.
 
-The short version: copy `infinite_forms_plugin.py` and
-`scripts/install_python_docx.py` into
-`~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/`,
-restart Resolve, run the installer script once from Workspace > Scripts,
-then launch **infinite_forms_plugin** from the same menu.
+If macOS blocks the installer as coming from an unidentified developer,
+right-click it > **Open** — Gatekeeper flags any downloaded script, and
+you only clear it once.
+
+See **[INSTALL.md](INSTALL.md)** for the full fresh-machine guide: the
+prerequisites the installer can't handle for you (Resolve Studio, Python,
+and the one scripting preference), the manual equivalent of every step,
+the per-project assets each feature expects, and a troubleshooting table.
 
 ## Repository layout
 
 ```
 infinite_forms_plugin.py      The plugin -- single file, no dependencies
                               beyond python-docx
+One Click Install Infinite Forms.command
+                              Double-click installer (macOS): dependency
+                              checks, validate, install, python-docx.
+                              Must keep its executable bit to stay
+                              double-clickable
 INSTALL.md                    Fresh-machine installation guide
 scripts/
   install_python_docx.py      Installs python-docx into Resolve's Python,
@@ -58,16 +70,39 @@ docs/
 
 ## Releasing an update
 
-The plugin self-updates from this repo. To publish a new version:
+To publish a new version:
 
 1. Bump `BUILD_TAG` at the top of `infinite_forms_plugin.py`
 2. Set the `VERSION` file to the exact same string
 3. Commit and push both together
 
-Installed plugins (with `UPDATE_REPO` configured) will show an Update
-button in the panel header on next launch. Downloads are validated
-(size + full compile) before replacing anything, and the previous
-version is kept as a `.bak` alongside.
+Both steps matter: the check compares the repo's `VERSION` against the
+installed `BUILD_TAG`, so a release that bumps only one of them is
+invisible to everyone.
+
+There are three ways an installed copy finds out:
+
+- **Automatically at launch** — every time the panel opens it checks once,
+  with a 3-second timeout so a slow network can't delay the window. The
+  result always lands in the panel log, including "up to date", so you can
+  see that it ran. Anything you have to act on — a new build, a private
+  repo, missing certificates — also pops the same dialog the button shows,
+  once the panel is up. Being offline is reported to the Console only, so a
+  machine that's offline on purpose isn't nagged every launch. Set
+  `UPDATE_STARTUP_DIALOG = False` to keep launch findings in the log only.
+- **Check for Update** at the bottom of the panel — the same check on
+  demand, with a fuller explanation in a dialog. It never touches the
+  installed file; it just tells you to download the project and re-run
+  the installer.
+- **The Update button** in the panel header — appears only when the launch
+  check found a new build, and installs in place. Downloads are validated
+  (size + full compile + end-of-file marker) before replacing anything,
+  and the previous version is kept as a `.bak` alongside.
+
+All three need `UPDATE_REPO` (top of the plugin file) pointing at a
+**public** repo. While the repo is private, GitHub answers 404 to an
+unauthenticated request, and both the launch check and the button report
+**"repo set to private"**.
 
 ## Notes
 
