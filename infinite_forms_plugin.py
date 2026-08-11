@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-05.1"
+BUILD_TAG = "2026-08-06.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -1646,6 +1646,15 @@ def build_location_groups(structure, clip_folder_map, package_order):
     never used in the package -- appended at the end of each group.
     A clip only joins the first group that claims it.
     """
+    SCRIPT_METADATA_LABELS = {
+        "final seo title", "primary keyword", "script", "description",
+        "hashtags", "seo title", "keywords", "meta description", "title",
+        "video story", "video story headline", "notes", "media note",
+    }
+
+    def is_metadata_label(name):
+        return _sort_norm(name) in SCRIPT_METADATA_LABELS
+
     package_ids = [e["cid"] for e in package_order]
     package_id_set = set(package_ids)
     groups = []
@@ -1715,6 +1724,8 @@ def build_location_groups(structure, clip_folder_map, package_order):
 
     for seg in structure:
         seg_name = seg["segment"]
+        if seg_name and is_metadata_label(seg_name):
+            continue  # doc-template metadata row, not a location
         matched = set()
         if seg_name:
             matched |= guarded(seg_name,
@@ -1728,6 +1739,8 @@ def build_location_groups(structure, clip_folder_map, package_order):
             misses.append(seg_name)
 
         for poi in seg["pois"]:
+            if is_metadata_label(poi):
+                continue  # bolded doc-template label, not a location
             poi_matched = guarded(poi, clips_matching_location(poi, clip_folder_map))
             if poi_matched:
                 if not add_group(poi, poi_matched):
