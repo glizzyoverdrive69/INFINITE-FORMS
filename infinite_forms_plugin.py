@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-06.1"
+BUILD_TAG = "2026-08-07.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -1469,6 +1469,28 @@ def on_apply_client_color(ev):
 # Skyscanner Seoul docx and Expedia Amsterdam docx export; see
 # extract_pois.py for the standalone, testable version of this logic)
 # ---------------------------------------------------------------------------
+# Doc-template metadata rows: never locations, never segments, never POIs.
+SCRIPT_METADATA_LABELS = {
+    "final seo title", "primary keyword", "script", "description",
+    "hashtags", "seo title", "keywords", "meta description", "title",
+    "video story", "video story headline", "notes", "media note",
+    "locations", "midform script and assets",
+}
+
+TIMESTAMP_RE = re.compile(r"^\(?\d{1,2}:\d{2}(:\d{2})?\)?$")
+
+
+def is_metadata_label(name):
+    return _sort_norm(name) in SCRIPT_METADATA_LABELS
+
+
+def _is_junk_poi(name):
+    """Timestamps, metadata labels, and fragments are never POIs."""
+    t = name.strip()
+    return (len(t) < 3 or TIMESTAMP_RE.match(t) is not None
+            or is_metadata_label(t))
+
+
 SEGMENT_RE = re.compile(
     r"^\s*(?:(?:Segment|Theme)\s*\d+\s*:\s*(?P<name>.+?)|(?P<marker>INTRO|OUTRO))"
     r"\s*(?:\(\s*\d+\s*words?\s*\))?\s*$",
@@ -1476,9 +1498,31 @@ SEGMENT_RE = re.compile(
 )
 
 
+def _row_metadata_label(row):
+    """First-cell label of a metadata-table row ('Final SEO Title:',
+    'Hashtags: 8-10 relevant...') normalised for stoplist lookup, or
+    None when the row isn't a labelled metadata row."""
+    try:
+        first = row.cells[0].text.strip().splitlines()[0]
+    except Exception:
+        return None
+    label = first.split(":", 1)[0]
+    label = re.sub(r"[()]", " ", label)
+    label = _sort_norm(label)
+    return label if label in SCRIPT_METADATA_LABELS or label == "destination" \
+        else None
+
+
 def _iter_doc_paragraphs(doc):
     """Yield every paragraph in document order, including inside tables --
-    Pages-exported scripts keep the whole script body in a table."""
+    Pages-exported scripts keep the whole script body in a table.
+
+    Metadata-table awareness: in a labelled row (Destination:, Final SEO
+    Title:, Hashtags:, ...) only the SCRIPT row's content cell is script;
+    the other rows' VALUE cells are titles/keywords -- often bold, short,
+    and city-named, i.e. perfect decoys for header detection -- and are
+    skipped entirely. Unlabelled rows flow through untouched, so older
+    templates parse exactly as before."""
     from docx.document import Document as _DocumentBody
     from docx.oxml.ns import qn
     from docx.table import Table, _Cell
@@ -1491,8 +1535,19 @@ def _iter_doc_paragraphs(doc):
                 yield Paragraph(child, parent)
             elif child.tag == qn("w:tbl"):
                 for row in Table(child, parent).rows:
-                    for cell in row.cells:
-                        yield from walk(cell)
+                    label = _row_metadata_label(row)
+                    if label is None:
+                        seen = set()
+                        for cell in row.cells:
+                            if id(cell._tc) in seen:
+                                continue
+                            seen.add(id(cell._tc))
+                            yield from walk(cell)
+                    elif label == "script":
+                        # Script row: the content cell (last cell) IS the
+                        # script -- parse it; skip the label cell.
+                        yield from walk(row.cells[-1])
+                    # any other metadata row: skipped wholesale
 
     yield from walk(doc)
 
@@ -1530,12 +1585,24 @@ def extract_script_structure(docx_path):
             current["narration"] = current["narration"].strip()
             segments.append(dict(current))
 
-    def start_segment(m):
-        nonlocal_current = m.group("name") or m.group("marker").upper()
+    def start_segment_named(raw_name):
         push()
         current.clear()
-        current.update({"segment": _clean_segment_name(nonlocal_current),
+        current.update({"segment": _clean_segment_name(raw_name),
                         "pois": [], "narration": ""})
+
+    def start_segment(m):
+        start_segment_named(m.group("name") or m.group("marker").upper())
+
+    def bold_line_is_header(line):
+        """New-template section headers are bare bold location lines
+        ('Fort Lauderdale Beach') with no 'Segment N:' prefix. Short,
+        not metadata, not a timestamp, no trailing colon."""
+        return (2 < len(line) <= 60
+                and len(line.split()) <= 7
+                and not line.endswith(":")
+                and not TIMESTAMP_RE.match(line)
+                and not is_metadata_label(line))
 
     for para in _iter_doc_paragraphs(doc):
         text = para.text.strip()
@@ -1556,11 +1623,16 @@ def extract_script_structure(docx_path):
 
         if not has_plain:
             # Fully-bold paragraph: may hold several soft-broken header
-            # lines; anything else in it is a section header, not a POI.
+            # lines. 'Segment N:'-style lines start segments as always;
+            # bare bold location lines (the Graphics Batch template) now
+            # start segments too, instead of being silently discarded.
             for line in text.splitlines():
-                lm = SEGMENT_RE.match(line.strip())
+                line = line.strip()
+                lm = SEGMENT_RE.match(line)
                 if lm:
                     start_segment(lm)
+                elif line and bold_line_is_header(line):
+                    start_segment_named(line)
             continue
 
         # Mixed paragraph: walk runs in order, so a bold header run that
@@ -1580,7 +1652,8 @@ def extract_script_structure(docx_path):
                         start_segment(pm)
                         continue
                     t = piece.strip("[](),.:;\u2014-").strip()
-                    if len(t) > 1 and t.lower() not in (p.lower() for p in current["pois"]):
+                    if t and not _is_junk_poi(t) and \
+                            t.lower() not in (p.lower() for p in current["pois"]):
                         current["pois"].append(t)
             else:
                 current["narration"] += rtext
@@ -1588,6 +1661,25 @@ def extract_script_structure(docx_path):
 
     push()
     return segments
+
+
+def extract_row5_locations(docx_path):
+    """The Graphics Batch template's 'Locations:' row is an explicit,
+    authoritative location list ('Used to batch create Pill Graphics').
+    Returns its entries, or [] when the doc has no such row."""
+    from docx import Document
+
+    doc = Document(docx_path)
+    for table in doc.tables:
+        for row in table.rows:
+            try:
+                label = row.cells[0].text.strip().lower()
+            except Exception:
+                continue
+            if label.startswith("locations"):
+                return [line.strip() for line in row.cells[1].text.splitlines()
+                        if line.strip()]
+    return []
 
 
 def _fold_accents(text):
@@ -1630,37 +1722,27 @@ def clips_matching_location(location_name, clip_folder_map):
     return matched
 
 
-def build_location_groups(structure, clip_folder_map, package_order):
+def build_location_groups(structure, clip_folder_map, package_order,
+                          extra_locations=None):
     """Turn the parsed script into ordered groups:
 
         (label, [package entries], [extra pool clip ids])
 
-    Matching per segment, all filtered/ordered against the Clip Asset
-    Package (the approved cut):
-      1. segment name matches bins (neighbourhood folders)
-      2. bolded POIs match bins (Skyscanner style)
-      3. NARRATION mentions bin names (covers segments whose locations
-         only exist as sub-location bins -- e.g. a "Centrum" segment
-         whose clips live in "Dam Square" and "Damrak" bins)
-    "Extras" are pool clips under the same matched locations that were
-    never used in the package -- appended at the end of each group.
-    A clip only joins the first group that claims it.
+    Clips now COMPETE across locations by match tier instead of
+    first-come-first-served: for every (clip, location) pair the best
+    tier is computed over the clip's folder path (exact 4 > containment
+    3 > fuzzy 2 > shared-token 1), plus narration mentions (exact 2 /
+    fuzzy 1) for named segments. Each clip goes to the location that
+    matches it BEST -- so 'Fort Lauderdale Beach' can never steal a
+    'Dania Beach (N)' clip on a weak shared token when Dania Beach
+    matches it exactly. Ties go to script order.
+
+    extra_locations (e.g. the doc's Row-5 'Locations:' list) are added
+    as additional groups after the script's own, for any entry no
+    script location already covers.
     """
-    SCRIPT_METADATA_LABELS = {
-        "final seo title", "primary keyword", "script", "description",
-        "hashtags", "seo title", "keywords", "meta description", "title",
-        "video story", "video story headline", "notes", "media note",
-    }
-
-    def is_metadata_label(name):
-        return _sort_norm(name) in SCRIPT_METADATA_LABELS
-
     package_ids = [e["cid"] for e in package_order]
     package_id_set = set(package_ids)
-    groups = []
-    misses = []
-    used = set()        # package_order indexes already claimed
-    extras_used = set() # pool clip ids already claimed as extras
 
     # Every folder name in the pool, for narration mention-matching
     all_folder_names = set()
@@ -1668,131 +1750,119 @@ def build_location_groups(structure, clip_folder_map, package_order):
         all_folder_names.update(folder_path)
     GENERIC_FOLDERS = {"master", "video", "footage", "clips", "media"}
 
-    def guarded(label, ids):
-        """Refuse absurdly broad matches (e.g. a city-level bin that
-        holds most of the package) so one segment can't swallow all."""
-        in_package = len(ids & package_id_set)
-        if len(structure) > 2 and in_package > max(4, int(len(package_ids) * 0.6)):
-            log(f"  (ignored over-broad match for '{label}' --"
-                f" {in_package} of {len(package_ids)} package clips)")
-            return set()
-        return ids
+    # --- Ordered location list from the script -------------------------
+    locations = []   # dicts: {"label", "narration"}
+    seen_labels = set()
 
-    def narration_matches(seg):
-        matched = set()
-        if not seg["narration"] or seg["segment"] in (None, "INTRO", "OUTRO"):
-            return matched
-        narr = _sort_norm(seg["narration"])
+    def add_location(label, narration=""):
+        key = _sort_norm(label)
+        if not key or key in seen_labels:
+            return
+        seen_labels.add(key)
+        locations.append({"label": label, "narration": narration})
+
+    for seg in structure:
+        seg_name = seg["segment"]
+        if seg_name and seg_name not in ("INTRO", "OUTRO") \
+                and not is_metadata_label(seg_name):
+            add_location(seg_name, seg.get("narration", ""))
+        for poi in seg["pois"]:
+            if not _is_junk_poi(poi):
+                add_location(poi)
+
+    for extra in (extra_locations or []):
+        if not _is_junk_poi(extra) and \
+                not any(_sort_match_tier(extra, loc["label"]) >= 2
+                        for loc in locations):
+            add_location(extra)
+
+    if not locations:
+        return [], []
+
+    # --- Narration mention tiers per location --------------------------
+    # folder name -> tier contributed by being mentioned in the location's
+    # narration (exact word-boundary 2, fuzzy sliding-window 1)
+    def narration_mention_tiers(narration):
+        tiers = {}
+        if not narration:
+            return tiers
+        narr = _sort_norm(narration)
         narr_words = narr.split()
         for folder_name in all_folder_names:
             nb = _sort_norm(folder_name)
             if len(nb) < 4 or nb in GENERIC_FOLDERS:
                 continue
-            hit = bool(re.search(r"\b" + re.escape(nb) + r"\b", narr))
-            if not hit:
-                # Fuzzy sliding window over the narration: a slightly
-                # misspelled or accent-drifted folder name still counts
-                # as mentioned. Also inherently reaches folders OUTSIDE
-                # the neighbourhood stack, anywhere in the pool.
-                k = max(1, len(nb.split()))
-                for i in range(0, max(0, len(narr_words) - k + 1)):
-                    window = " ".join(narr_words[i:i + k])
-                    if abs(len(window) - len(nb)) <= 3 and \
-                       SequenceMatcher(None, window, nb).ratio() >= 0.86:
-                        hit = True
-                        break
-            if hit:
-                ids = {cid for cid, fp in clip_folder_map.items()
-                       if folder_name in fp}
-                matched |= guarded(folder_name, ids)
-        return matched
+            if re.search(r"\b" + re.escape(nb) + r"\b", narr):
+                tiers[folder_name] = 2
+                continue
+            k = max(1, len(nb.split()))
+            for i in range(0, max(0, len(narr_words) - k + 1)):
+                window = " ".join(narr_words[i:i + k])
+                if abs(len(window) - len(nb)) <= 3 and \
+                   SequenceMatcher(None, window, nb).ratio() >= 0.86:
+                    tiers[folder_name] = 1
+                    break
+        return tiers
 
-    def add_group(label, matched_ids):
-        entries = [entry for idx, entry in enumerate(package_order)
-                   if entry["cid"] in matched_ids and idx not in used]
+    for loc in locations:
+        loc["mentions"] = narration_mention_tiers(loc.get("narration", ""))
+
+    # --- Best tier for every (clip, location) pair ----------------------
+    def clip_location_tier(folder_path, loc):
+        best = 0
+        for folder in folder_path:
+            t = _sort_match_tier(folder, loc["label"])
+            if t > best:
+                best = t
+            mention = loc["mentions"].get(folder, 0)
+            if mention > best:
+                best = mention
+        return best
+
+    # --- Over-broad guard: a location whose direct claims swallow most
+    # of the package (a city-level bin matching a city-named location)
+    # is dropped entirely, with a log line saying so.
+    dropped = set()
+    if len(locations) > 2:
+        for li, loc in enumerate(locations):
+            in_package = sum(
+                1 for cid in package_ids
+                if clip_location_tier(clip_folder_map.get(cid) or [], loc) > 0)
+            if in_package > max(4, int(len(package_ids) * 0.6)):
+                dropped.add(li)
+                log(f"  (ignored over-broad location '{loc['label']}' --"
+                    f" it matched {in_package} of {len(package_ids)}"
+                    f" package clips)")
+
+    # --- Competition: each clip to its best-matching location ----------
+    assignment = {}   # cid -> (tier, location index)
+    for cid, folder_path in clip_folder_map.items():
+        best_tier, best_li = 0, None
+        for li, loc in enumerate(locations):
+            if li in dropped:
+                continue
+            tier = clip_location_tier(folder_path, loc)
+            if tier > best_tier:
+                best_tier, best_li = tier, li
+        if best_li is not None:
+            assignment[cid] = (best_tier, best_li)
+
+    # --- Groups in script order -----------------------------------------
+    groups = []
+    misses = []
+    for li, loc in enumerate(locations):
+        if li in dropped:
+            continue
+        claimed = {cid for cid, (t, i) in assignment.items() if i == li}
+        entries = [e for e in package_order if e["cid"] in claimed]
         extras = [cid for cid in clip_folder_map
-                  if cid in matched_ids
-                  and cid not in package_id_set
-                  and cid not in extras_used]
+                  if cid in claimed and cid not in package_id_set]
         if entries or extras:
-            used.update(idx for idx, entry in enumerate(package_order)
-                        if entry["cid"] in matched_ids and idx not in used)
-            extras_used.update(extras)
-            groups.append((label, entries, extras))
-            return True
-        return False
-
-    for seg in structure:
-        seg_name = seg["segment"]
-        if seg_name and is_metadata_label(seg_name):
-            continue  # doc-template metadata row, not a location
-        matched = set()
-        if seg_name:
-            matched |= guarded(seg_name,
-                               clips_matching_location(seg_name, clip_folder_map))
-        matched |= narration_matches(seg)
-
-        seg_grouped = False
-        if matched and seg_name and seg_name not in ("INTRO", "OUTRO"):
-            seg_grouped = add_group(seg_name, matched)
-        if seg_name and seg_name not in ("INTRO", "OUTRO") and not seg_grouped:
-            misses.append(seg_name)
-
-        for poi in seg["pois"]:
-            if is_metadata_label(poi):
-                continue  # bolded doc-template label, not a location
-            poi_matched = guarded(poi, clips_matching_location(poi, clip_folder_map))
-            if poi_matched:
-                if not add_group(poi, poi_matched):
-                    pass  # everything already claimed by earlier groups
-            else:
-                misses.append(poi)
+            groups.append((loc["label"], entries, extras))
+        else:
+            misses.append(loc["label"])
 
     return groups, misses
-
-
-AUDIO_EXTENSIONS = (".wav", ".mp3", ".aif", ".aiff", ".m4a", ".flac", ".ogg")
-GRAPHIC_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".psd",
-                      ".exr", ".tga", ".bmp", ".gif", ".svg", ".ai")
-
-
-def is_excluded_extra(media_pool_item):
-    """Extras must be real footage: no music/VO, no stills/graphics, no
-    titles or generators."""
-    if is_audio_clip(media_pool_item):
-        return True
-    try:
-        clip_type = (media_pool_item.GetClipProperty("Type") or "").lower()
-        if any(word in clip_type for word in ("still", "graphic", "title",
-                                              "generator", "matte")):
-            return True
-    except Exception:
-        pass
-    try:
-        name = (media_pool_item.GetName() or "").lower()
-        if name.endswith(GRAPHIC_EXTENSIONS):
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def is_audio_clip(media_pool_item):
-    """Music/VO files living in POI bins must never be pulled into an
-    assembly as extras."""
-    try:
-        clip_type = (media_pool_item.GetClipProperty("Type") or "").lower()
-        if "audio" in clip_type and "video" not in clip_type:
-            return True
-    except Exception:
-        pass
-    try:
-        name = (media_pool_item.GetName() or "").lower()
-        if name.endswith(AUDIO_EXTENSIONS):
-            return True
-    except Exception:
-        pass
-    return False
 
 
 def group_neighbourhood(entry_cids, clip_folder_map):
@@ -1847,6 +1917,7 @@ def run_assembly(project, media_pool, params):
     # --- Parse -----------------------------------------------------------
     try:
         structure = extract_script_structure(params["script_path"])
+        row5_locations = extract_row5_locations(params["script_path"])
     except ImportError:
         log("python-docx is not installed in Resolve's Python.")
         log("In Resolve's Console run:  import sys; print(sys.executable)")
@@ -1917,7 +1988,22 @@ def run_assembly(project, media_pool, params):
         return
 
     # --- Match into location groups ---------------------------------------
-    groups, misses = build_location_groups(structure, clip_folder_map, package_order)
+    if row5_locations:
+        log(f"Script 'Locations:' row: {len(row5_locations)} location(s) --"
+            f" using it as the authoritative list.")
+    groups, misses = build_location_groups(structure, clip_folder_map,
+                                           package_order,
+                                           extra_locations=row5_locations)
+
+    # Row-5 coverage checklist: authoritative locations with no footage
+    if row5_locations:
+        grouped_labels = [g[0] for g in groups]
+        uncovered = [entry for entry in row5_locations
+                     if not any(_sort_match_tier(entry, gl) >= 2
+                                for gl in grouped_labels)]
+        if uncovered:
+            log(f"  Row-5 locations with NO footage found:"
+                f" {', '.join(uncovered)}")
     if misses:
         log(f"  Script locations with no matching clips:"
             f" {', '.join(misses)}")
@@ -2341,6 +2427,12 @@ SORT_GENERIC_WORDS = {
     # directional/civic modifiers -- shared by unrelated places ("National
     # Gallery" vs "National Theatre"), so never distinctive on their own
     "national", "royal", "east", "west", "north", "south", "central", "greater",
+    # coastal/US vocabulary -- 'Dania Beach' must never match 'Fort
+    # Lauderdale Beach' on the word 'beach'
+    "beach", "beaches", "pier", "bay", "shore", "shores", "coast", "coastal",
+    "island", "isle", "key", "keys", "harbor", "harbour", "sea", "ocean",
+    "sands", "cove", "boardwalk", "promenade", "boulevard", "blvd",
+    "avenue", "ave", "fort", "state", "trail",
 }
 
 
