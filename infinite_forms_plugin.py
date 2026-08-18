@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-07.1"
+BUILD_TAG = "2026-08-07.2"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -1865,6 +1865,50 @@ def build_location_groups(structure, clip_folder_map, package_order,
     return groups, misses
 
 
+AUDIO_EXTENSIONS = (".wav", ".mp3", ".aif", ".aiff", ".m4a", ".flac", ".ogg")
+GRAPHIC_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".psd",
+                      ".exr", ".tga", ".bmp", ".gif", ".svg", ".ai")
+
+
+def is_audio_clip(media_pool_item):
+    """Music/VO files living in POI bins must never be pulled into an
+    assembly as extras."""
+    try:
+        clip_type = (media_pool_item.GetClipProperty("Type") or "").lower()
+        if "audio" in clip_type and "video" not in clip_type:
+            return True
+    except Exception:
+        pass
+    try:
+        name = (media_pool_item.GetName() or "").lower()
+        if name.endswith(AUDIO_EXTENSIONS):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_excluded_extra(media_pool_item):
+    """Extras must be real footage: no music/VO, no stills/graphics, no
+    titles or generators."""
+    if is_audio_clip(media_pool_item):
+        return True
+    try:
+        clip_type = (media_pool_item.GetClipProperty("Type") or "").lower()
+        if any(word in clip_type for word in ("still", "graphic", "title",
+                                              "generator", "matte")):
+            return True
+    except Exception:
+        pass
+    try:
+        name = (media_pool_item.GetName() or "").lower()
+        if name.endswith(GRAPHIC_EXTENSIONS):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def group_neighbourhood(entry_cids, clip_folder_map):
     """The neighbourhood a group's clips live in: the (N)-marked ancestor
     folder that most of the group's clips share. Returns the folder name
@@ -2050,6 +2094,7 @@ def run_assembly(project, media_pool, params):
     cursor = int(new_tl.GetStartFrame())
     existing_titles = {}
     placed = failed = grade_fails = 0
+    GRADE_COPY_SUSPECT = [0]
 
     def place_package_entry(entry, record_frame):
         """Append one Clip Asset Package entry with its exact trims,
@@ -2091,6 +2136,16 @@ def run_assembly(project, media_pool, params):
         try:
             if not entry["item"].CopyGrades([new_item]):
                 grade_fails += 1
+            else:
+                # CopyGrades can return True yet visibly not copy on some
+                # builds -- compare node counts to catch a silent no-op.
+                try:
+                    src_nodes = entry["item"].GetNodeGraph().GetNumNodes()
+                    dst_nodes = new_item.GetNodeGraph().GetNumNodes()
+                    if src_nodes and dst_nodes and dst_nodes < src_nodes:
+                        GRADE_COPY_SUSPECT[0] += 1
+                except Exception:
+                    pass  # GetNodeGraph needs Resolve 19+ -- fine without
         except Exception:
             grade_fails += 1
         try:
@@ -2178,6 +2233,10 @@ def run_assembly(project, media_pool, params):
                               LT_TITLE_VIDEO_TRACK)
         log(f"  Unused package clips placed at the end: {len(leftover)}")
 
+    if GRADE_COPY_SUSPECT[0]:
+        log(f"  Warning: {GRADE_COPY_SUSPECT[0]} clip(s) report fewer colour"
+            f" nodes than their package source -- CopyGrades may have"
+            f" silently not copied the Clip-tab grade on this build.")
     log(f"Assembly done. Placed {placed} clip(s) in {len(groups)} group(s)"
         f" on '{tl_name}' ({failed} failed).")
     if grade_fails:
