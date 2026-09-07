@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-28.2"
+BUILD_TAG = "2026-08-29.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -547,12 +547,34 @@ def run_loop_resilient(dispatcher, context=""):
     """Run a dispatcher loop, surviving errors thrown inside Resolve's
     OWN event dispatch (e.g. KeyError: 'On' when a widget emits an event
     nothing registered for). Such errors otherwise collapse every window.
-    Logs and resumes; gives up after repeated failures."""
+
+    Stray-event KeyErrors are BENIGN and proportional to how much was
+    logged before a nested dialog opened -- a long report queues dozens.
+    They are absorbed silently (one summary line at the end) and only a
+    very high ceiling guards against a genuinely stuck loop. Real errors
+    keep the strict cap."""
     failures = 0
+    strays = 0
     while True:
         try:
             dispatcher.RunLoop()
+            if strays:
+                log_quiet(f"(absorbed {strays} stray dispatcher event(s)"
+                          f"{f' in {context}' if context else ''})")
             return
+        except KeyError as e:
+            if e.args == ("On",):
+                strays += 1
+                if strays >= 500:
+                    log_quiet("Stray-event storm -- closing this loop.")
+                    return
+                continue
+            failures += 1
+            log_quiet(f"Dispatcher error{f' in {context}' if context else ''}"
+                      f" (resumed):\n{traceback.format_exc()}")
+            if failures >= 25:
+                log_quiet("Too many dispatcher errors -- closing this loop.")
+                return
         except Exception:
             failures += 1
             log_quiet(f"Dispatcher error{f' in {context}' if context else ''}"
@@ -2494,6 +2516,12 @@ SORT_GENERIC_WORDS = {
     "island", "isle", "key", "keys", "harbor", "harbour", "sea", "ocean",
     "sands", "cove", "boardwalk", "promenade", "boulevard", "blvd",
     "avenue", "ave", "fort", "state", "trail",
+    # Spanish/Catalan geography -- 'Placa X' must never match 'Placa Y'
+    # on the word for square/beach/cove/street alone
+    "placa", "plaza", "playa", "cala", "calle", "carrer", "avinguda",
+    "passeig", "carretera", "cami", "port", "puerto", "mirador", "mercat",
+    "mercado", "castell", "castillo", "esglesia", "iglesia", "parc",
+    "parque", "jardins", "jardines", "punta", "torre", "museu", "museo",
 }
 
 
@@ -2594,6 +2622,8 @@ def parse_shoot_notes(docx_path):
                     if cand.lower() not in seen:
                         seen.add(cand.lower())
                         ordered.append(cand)
+                if _is_placeholder_title(title):
+                    continue  # empty template row, not a real POI
                 current_theme["pois"].append({
                     "label": first_line,
                     "title": title,
@@ -2671,6 +2701,8 @@ def parse_bex_shoot_notes(docx_path):
                     label = "Contingency Checklist Item"
                 else:
                     label = "Item " + re.search(r"(\d+\.\d+)", first_line).group(1)
+                if _is_placeholder_title(title or title_line):
+                    continue  # empty template row, not a real item
                 current["pois"].append({
                     "label": label,
                     "title": title or title_line,
@@ -2691,6 +2723,16 @@ def _sort_distinctive_tokens(name):
     return {w for w in _sort_norm(name).split()
             if len(w) >= 4 and w not in SORT_GENERIC_WORDS
             and w not in SORT_EXTRA_GENERIC}
+
+
+PLACEHOLDER_TITLES = {
+    "name of poi", "name of poi item", "name of item", "name of location",
+    "lorem ipsum", "lorum ipsum", "tbc", "tbd", "poi name", "item name",
+}
+
+
+def _is_placeholder_title(title):
+    return _sort_norm(title.replace("/", " ")) in PLACEHOLDER_TITLES
 
 
 def _extract_permission_note(lines):
@@ -2747,17 +2789,43 @@ def _sort_match_tier(folder_name, candidate):
     return 0
 
 
-def _sort_best_match(folder_name, themes):
+def _sort_best_match(folder_name, themes, nbh_tokens=None):
+    """nbh_tokens (Expedia mode): {theme_num: tokens of that
+    neighbourhood's name}. A neighbourhood's name is generic when
+    matching OTHER neighbourhoods' items ('Alcudia Beach' must not
+    token-match 'Alcudia Medieval City Walls' on the town name) but
+    stays distinctive for its own ('Port of Soller' should still match
+    'Port de Soller Bay & Beach' on 'Soller')."""
     if _sort_norm(folder_name) in SORT_FOLDER_STOPLIST:
         return 0, None, None
-    best = (0, None, None)
-    for theme in themes:
-        for poi in theme["pois"]:
-            for cand in poi["candidates"]:
-                tier = _sort_match_tier(folder_name, cand)
-                if tier > best[0]:
-                    best = (tier, theme, poi)
-    return best
+    all_nbh = set()
+    if nbh_tokens:
+        for toks in nbh_tokens.values():
+            all_nbh |= toks
+    best = (0, 0.0, None, None)
+    base_extra = set(SORT_EXTRA_GENERIC)
+    fn = _sort_norm(folder_name)
+    try:
+        for theme in themes:
+            if nbh_tokens:
+                own = nbh_tokens.get(theme["num"], set())
+                SORT_EXTRA_GENERIC.clear()
+                SORT_EXTRA_GENERIC.update(base_extra | (all_nbh - own))
+            for poi in theme["pois"]:
+                for cand in poi["candidates"]:
+                    tier = _sort_match_tier(folder_name, cand)
+                    if tier == 0:
+                        continue
+                    # ties on tier break by whole-name similarity, so
+                    # 'Cala de Deia' prefers 'Cala Deia' over 'Deia Old
+                    # Town' when both share the token 'deia'
+                    ratio = SequenceMatcher(None, fn, _sort_norm(cand)).ratio()
+                    if (tier, ratio) > (best[0], best[1]):
+                        best = (tier, ratio, theme, poi)
+    finally:
+        SORT_EXTRA_GENERIC.clear()
+        SORT_EXTRA_GENERIC.update(base_extra)
+    return best[0], best[2], best[3]
 
 
 def find_folder_by_name(folder, name):
@@ -3141,11 +3209,20 @@ def on_sort_shoot_notes(ev):
         return
 
     # The destination's own name must never be a distinctive matching
-    # token ('Vienna Concert House' vs 'Vienna Operahouse').
+    # token ('Vienna Concert House' vs 'Vienna Operahouse'). In Expedia
+    # mode the neighbourhood names get the same treatment -- 'Alcudia
+    # Beach' must not token-match 'Alcudia Medieval City Walls' just for
+    # being in Alcudia.
     SORT_EXTRA_GENERIC.clear()
     for source in (destination or "", params["dest_name"]):
         SORT_EXTRA_GENERIC.update(
             w for w in _sort_norm(source).split() if len(w) >= 4)
+    nbh_tokens = None
+    if client == "expedia":
+        nbh_tokens = {
+            theme["num"]: {w for w in _sort_norm(
+                theme["name"].split("\u2014")[0]).split() if len(w) >= 4}
+            for theme in themes}
 
     root = media_pool.GetRootFolder()
     raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER) or root
@@ -3162,7 +3239,8 @@ def on_sort_shoot_notes(ev):
     # --- Build the plan --------------------------------------------------
     plan = []   # (folder, theme or None, poi or None, tier)
     for sub in poi_folders:
-        tier, theme, poi = _sort_best_match(sub.GetName(), themes)
+        tier, theme, poi = _sort_best_match(sub.GetName(), themes,
+                                            nbh_tokens=nbh_tokens)
         plan.append((sub, theme, poi, tier))
 
     tag = {4: "exact", 3: "contains", 2: "fuzzy", 1: "token"}
