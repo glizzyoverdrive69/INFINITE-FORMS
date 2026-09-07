@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-07.2"
+BUILD_TAG = "2026-08-28.2"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -326,7 +326,7 @@ PANEL = {"collapsed": False, "pinned": False}
 win = None
 items = None
 
-PANEL_FULL_SIZE = [480, 700]
+PANEL_FULL_SIZE = [480, 740]
 PANEL_COLLAPSED_SIZE = [480, 84]
 
 
@@ -371,6 +371,7 @@ def build_main_panel():
                         [
                             ui.Button({"ID": "BtnLowerThirds", "Text": "Auto Lower Thirds"}),
                             ui.Button({"ID": "BtnBinFinder", "Text": "Bin Finder"}),
+                            ui.Button({"ID": "BtnClipCount", "Text": "Clip Count"}),
                             ui.Button({"ID": "BtnApplyClientColor", "Text": "Colour Grading Prep"}),
                             ui.Button({"ID": "BtnAssemble", "Text": "Mid/Short Form Assembly"}),
                             ui.Button({"ID": "BtnRenameTracks", "Text": "Rename Video & Audio Tracks"}),
@@ -433,6 +434,7 @@ def build_main_panel():
     win.On.BtnRenameTracks.Clicked = guard(on_rename_tracks)
     win.On.BtnSortShootNotes.Clicked = guard(on_sort_shoot_notes)
     win.On.BtnBinFinder.Clicked = guard(on_bin_finder)
+    win.On.BtnClipCount.Clicked = guard(on_clip_count)
 
     apply_panel_style(win)
     _apply_collapse_state()
@@ -2501,7 +2503,7 @@ def _sort_norm(name):
         if n.endswith(suffix):
             n = n[: -len(suffix)].strip()
     n = re.sub(r"[\u2019']", "", n)   # apostrophes deleted: st paul's -> st pauls
-    n = re.sub(r"[\-\u2013\u2014!_]", " ", n)
+    n = re.sub(r"[\-\u2013\u2014!_*\u2022]", " ", n)  # * is the permission flag
     n = re.sub(r"\b\d+\b", " ", n)  # drop numeric ID suffixes like 44304425
     n = re.sub(r"\s+", " ", n)
     return n.strip()
@@ -2538,7 +2540,11 @@ def _sort_candidate_locations(lines):
         if not line:
             continue
         low = line.lower()
-        if low.startswith(("shot suggestion", "note", "other notable", "general")):
+        if low.startswith(("shot suggestion", "note", "other notable", "general",
+                           "folder structure", "folder name", "folder:", "lat/long",
+                           "location name", "located in", "sub location",
+                           "sub-location", "contact", "timing consideration",
+                           "permission", "name:")):
             continue
         if ":" in line:
             prefix = line.split(":", 1)[0].strip()
@@ -2567,7 +2573,7 @@ def parse_shoot_notes(docx_path):
             c0 = row.cells[0].text.strip()
             c1 = row.cells[1].text.strip()
             if c0.lower().startswith("destination:") and not destination:
-                destination = c0.split(":", 1)[1].strip()
+                destination = c0.splitlines()[0].split(":", 1)[1].strip()
             first_line = c0.splitlines()[0].strip() if c0 else ""
 
             tm = SORT_THEME_RE.match(first_line)
@@ -2592,13 +2598,115 @@ def parse_shoot_notes(docx_path):
                     "label": first_line,
                     "title": title,
                     "candidates": ordered,
+                    "permission": _extract_permission_note(lines),
                 })
     return destination, themes
 
 
+BEX_NBH_RE = re.compile(r"^Neighbou?rhood\s*(\d+)\s*:", re.IGNORECASE)
+BEX_ITEM_RE = re.compile(
+    r"^(Checklist\s*Item\s*\d+\.\d+|Contingency\s*Checklist\s*Items?)$",
+    re.IGNORECASE)
+BEX_FOLDER_RE = re.compile(r"\(.*?Folder(?:\s*name)?\s*:?\s*([^,)]+)",
+                           re.IGNORECASE)
+
+
+def parse_bex_shoot_notes(docx_path):
+    """Expedia/BEX shoot notes -> the same (destination, themes) shape as
+    the Skyscanner parser, so all matching and reporting is shared.
+    BEX organises by Neighbourhood, and the writers specify the exact bin
+    name inline ("Casa Batllo (Folder: Casa Batllo, NEI Eixample)") --
+    that explicit folder name becomes the top matching candidate."""
+    from docx import Document
+
+    doc = Document(docx_path)
+    destination = None
+    themes = []
+    current = None
+
+    for table in doc.tables:
+        for row in table.rows:
+            c0 = row.cells[0].text.strip()
+            c1 = row.cells[1].text.strip()
+            if c0.lower().startswith("destination:") and not destination:
+                destination = c0.splitlines()[0].split(":", 1)[1].strip()
+            first_line = c0.splitlines()[0].strip() if c0 else ""
+
+            nm = BEX_NBH_RE.match(first_line)
+            if nm and c1:
+                nbh_line = c1.splitlines()[0].strip()
+                nbh_name = re.split(r"\s*\(", nbh_line)[0].strip()
+                folder_m = BEX_FOLDER_RE.search(nbh_line)
+                current = {
+                    "num": int(nm.group(1)),
+                    "name": nbh_name,
+                    "pois": [],
+                    "_nbh_folder": folder_m.group(1).strip() if folder_m else None,
+                }
+                themes.append(current)
+                continue
+
+            if current is not None and first_line.lower().startswith("theme"):
+                theme_name = c1.splitlines()[0].strip() if c1 else ""
+                if theme_name:
+                    current["name"] = current["name"] + " \u2014 " + theme_name
+                continue
+
+            im = BEX_ITEM_RE.match(first_line)
+            if im and current is not None and c1:
+                lines = [l for l in c1.splitlines() if l.strip()]
+                title_line = lines[0].strip()
+                title = re.split(r"\s*\(", title_line)[0].strip()
+                folder_m = BEX_FOLDER_RE.search(title_line)
+                explicit = folder_m.group(1).strip() if folder_m else None
+                cands = ([explicit] if explicit else []) \
+                    + _sort_title_locations(title) \
+                    + _sort_candidate_locations(lines[1:])
+                seen, ordered = set(), []
+                for cand in cands:
+                    if cand and cand.lower() not in seen:
+                        seen.add(cand.lower())
+                        ordered.append(cand)
+                if first_line.lower().startswith("contingency"):
+                    label = "Contingency Checklist Item"
+                else:
+                    label = "Item " + re.search(r"(\d+\.\d+)", first_line).group(1)
+                current["pois"].append({
+                    "label": label,
+                    "title": title or title_line,
+                    "candidates": ordered,
+                    "permission": _extract_permission_note(lines),
+                })
+    return destination, themes
+
+
+
+# Tokens of the CURRENT destination ("Vienna", "Los Angeles") -- set per
+# sort run so "Vienna Concert House" can never token-match "Vienna
+# Operahouse" on the city name alone.
+SORT_EXTRA_GENERIC = set()
+
+
 def _sort_distinctive_tokens(name):
     return {w for w in _sort_norm(name).split()
-            if len(w) >= 4 and w not in SORT_GENERIC_WORDS}
+            if len(w) >= 4 and w not in SORT_GENERIC_WORDS
+            and w not in SORT_EXTRA_GENERIC}
+
+
+def _extract_permission_note(lines):
+    """First meaningful permission line from a POI/checklist cell --
+    either a sentence containing 'permission', or the line following a
+    bare 'Permissions' label."""
+    for i, line in enumerate(lines):
+        t = line.strip()
+        if "permission" in t.lower():
+            if len(t) > 14:
+                return t[:110]
+            for follow in lines[i + 1:i + 3]:
+                f = follow.strip()
+                if f and len(f) > 5:
+                    return f[:110]
+    return None
 
 
 def _sort_distinctive_join(name):
@@ -2769,6 +2877,136 @@ def try_set_folder_color(folder, color):
     return False
 
 
+def collect_clip_count_folders(container, out):
+    """Depth-first: gather POI folders at any depth, TRAVERSING INTO
+    Theme/EXTRAS containers -- unlike the sort collector, Clip Count must
+    see inside an already-sorted destination."""
+    for child in container.GetSubFolderList():
+        if is_poi_folder(child) or is_leaf_folder(child):
+            out.append(child)
+        else:
+            collect_clip_count_folders(child, out)
+    return out
+
+
+def count_clips_recursive(folder):
+    """Every clip in a folder and all of its subfolders."""
+    total = len(folder.GetClipList() or [])
+    for sub in folder.GetSubFolderList():
+        total += count_clips_recursive(sub)
+    return total
+
+
+def clip_count_dialog(media_pool):
+    """Pick the destination to count. Returns its name or None."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    result = {"dest": None}
+
+    root = media_pool.GetRootFolder()
+    raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER)
+    source_parent = raw_folder or root
+    dest_names = [f.GetName() for f in source_parent.GetSubFolderList()]
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "ClipCountDlg",
+            "WindowTitle": "Clip Count",
+            "Geometry": [220, 220, 460, 170],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.Label({"Text": f"Destination folder (inside"
+                                      f" {source_parent.GetName()})"}),
+                    ui.ComboBox({"ID": "ClipCountDestCombo"}),
+                    ui.Label({"ID": "ClipCountWarn", "Text": ""}),
+                    ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                        ui.Button({"ID": "BtnClipCountCancel", "Text": "Cancel"}),
+                        ui.Button({"ID": "BtnClipCountRun", "Text": "Count"}),
+                    ]),
+                ],
+            )
+        ],
+    )
+
+    ditems = dlg.GetItems()
+    for name in dest_names:
+        ditems["ClipCountDestCombo"].AddItem(name)
+
+    def on_run(_ev):
+        dest = ditems["ClipCountDestCombo"].CurrentText
+        if not dest:
+            ditems["ClipCountWarn"].Text = "No destination folder selected."
+            return
+        result["dest"] = dest
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev):
+        dlg_disp.ExitLoop()
+
+    dlg.On.BtnClipCountRun.Clicked = on_run
+    dlg.On.BtnClipCountCancel.Clicked = on_cancel
+    dlg.On.ClipCountDlg.Close = on_cancel
+
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "clip count dialog")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["dest"]
+
+
+def on_clip_count(ev):
+    project, _, media_pool = get_context()
+    if not project:
+        log("No project open.")
+        return
+
+    dest_name = clip_count_dialog(media_pool)
+    if not dest_name:
+        log("Clip Count cancelled.")
+        return
+
+    root = media_pool.GetRootFolder()
+    raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER) or root
+    dest_folder = get_subfolder(raw_folder, dest_name)
+    if not dest_folder:
+        log(f"Destination folder '{dest_name}' not found.")
+        return
+
+    log(f"Counting clips per location under '{dest_name}'...")
+    poi_folders = collect_clip_count_folders(dest_folder, [])
+    counts = [(count_clips_recursive(f), f.GetName().strip()) for f in poi_folders]
+    counts.sort(key=lambda pair: (pair[0], pair[1].lower()))
+    total_clips = sum(c for c, _ in counts)
+
+    log(f"Clip Count -- {dest_name}: {len(counts)} location(s),"
+        f" {total_clips} clip(s). Fewest first:")
+    for c, name in counts:
+        log(f"  {c:5}  {name}")
+
+    summary_lines = [
+        f"Destination: {dest_name}",
+        f"Locations counted: {len(counts)}",
+        f"Total clips: {total_clips}",
+    ]
+    if counts:
+        avg = total_clips / len(counts)
+        summary_lines.append(f"Average per location: {avg:.0f}")
+        summary_lines.append("")
+        summary_lines.append("Lowest counts -- worth a curious look:")
+        for c, name in counts[:10]:
+            summary_lines.append(f"  {c:5}  {name}")
+        if len(counts) > 10:
+            summary_lines.append(f"  ...full list of {len(counts)}"
+                                 f" locations in the log.")
+    summary_dialog("Clip Count", summary_lines)
+
+
 def sort_dialog(project, media_pool):
     """Blocking dialog: shoot-notes docx, destination folder, preview
     toggle. Returns dict or None."""
@@ -2786,13 +3024,15 @@ def sort_dialog(project, media_pool):
         {
             "ID": "SortDlg",
             "WindowTitle": "Sort by Shoot Notes",
-            "Geometry": [200, 200, 480, 260],
+            "Geometry": [200, 200, 480, 300],
             "StyleSheet": PANEL_QSS,
         },
         [
             ui.VGroup(
                 {"Spacing": 8},
                 [
+                    ui.Label({"Text": "Client"}),
+                    ui.ComboBox({"ID": "SortClientCombo"}),
                     ui.Label({"Text": "Shoot notes (.docx)"}),
                     ui.HGroup({"Spacing": 6, "Weight": 0}, [
                         ui.LineEdit({"ID": "SortNotesPath",
@@ -2816,6 +3056,8 @@ def sort_dialog(project, media_pool):
     )
 
     ditems = dlg.GetItems()
+    ditems["SortClientCombo"].AddItem("Skyscanner -- sort bins + report")
+    ditems["SortClientCombo"].AddItem("Expedia -- report only (no sorting)")
     for name in dest_names:
         ditems["SortDestCombo"].AddItem(name)
 
@@ -2839,7 +3081,9 @@ def sort_dialog(project, media_pool):
         if not dest_name:
             ditems["SortWarn"].Text = "No destination folder selected."
             return
+        client_text = ditems["SortClientCombo"].CurrentText or ""
         result["params"] = {
+            "client": "expedia" if client_text.startswith("Expedia") else "skyscanner",
             "notes_path": notes_path,
             "dest_name": dest_name,
             "preview": bool(ditems["SortPreview"].Checked),
@@ -2873,8 +3117,12 @@ def on_sort_shoot_notes(ev):
         log("Sort by Shoot Notes cancelled.")
         return
 
+    client = params.get("client", "skyscanner")
     try:
-        destination, themes = parse_shoot_notes(params["notes_path"])
+        if client == "expedia":
+            destination, themes = parse_bex_shoot_notes(params["notes_path"])
+        else:
+            destination, themes = parse_shoot_notes(params["notes_path"])
     except ImportError:
         log("python-docx is not installed in Resolve's Python -- run the"
             " install_python_docx script.")
@@ -2884,11 +3132,20 @@ def on_sort_shoot_notes(ev):
         return
 
     n_pois = sum(len(t["pois"]) for t in themes)
-    log(f"Shoot notes parsed: destination '{destination}',"
-        f" {len(themes)} theme(s), {n_pois} POI(s).")
+    kind = "neighbourhood(s)" if client == "expedia" else "theme(s)"
+    log(f"Shoot notes parsed ({client}): destination '{destination}',"
+        f" {len(themes)} {kind}, {n_pois} checklist item(s).")
     if not themes:
-        log("No 'Theme N:' rows found -- is this a shoot-notes document?")
+        log("No theme/neighbourhood rows found -- is this the right"
+            " client's shoot-notes document?")
         return
+
+    # The destination's own name must never be a distinctive matching
+    # token ('Vienna Concert House' vs 'Vienna Operahouse').
+    SORT_EXTRA_GENERIC.clear()
+    for source in (destination or "", params["dest_name"]):
+        SORT_EXTRA_GENERIC.update(
+            w for w in _sort_norm(source).split() if len(w) >= 4)
 
     root = media_pool.GetRootFolder()
     raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER) or root
@@ -2938,24 +3195,76 @@ def on_sort_shoot_notes(ev):
         for name in unfound_pois:
             log(f"    {name}")
 
+    # Tally: regular items vs contingency, counted separately
+    regular_total = contingency_total = 0
+    regular_hit = contingency_hit = 0
+    for theme in themes:
+        for poi in theme["pois"]:
+            is_contingency = poi["label"].lower().startswith("contingency")
+            hit = (theme["num"], poi["label"]) in matched_poi_keys
+            if is_contingency:
+                contingency_total += 1
+                contingency_hit += hit
+            else:
+                regular_total += 1
+                regular_hit += hit
+
+    # Permission flags: any POI folder in scope whose name starts with *
+    flagged = []
+    for folder, theme, poi, tier in plan:
+        raw_name = folder.GetName().strip()
+        if raw_name.startswith("*"):
+            entry = raw_name
+            if poi is not None:
+                entry += f"  ->  {poi['label']} - {poi['title'][:34]}"
+                if poi.get("permission"):
+                    entry += f"\n      notes: {poi['permission'][:90]}"
+            flagged.append(entry)
+
     summary_lines = [
         f"Destination: {destination or params['dest_name']}",
-        f"Themes in notes: {len(themes)}   POIs in notes: {total_pois}",
-        f"POIs with footage found: {len(matched_poi_keys)}",
+        "",
+        f"Checklist Items Tally: {regular_hit}/{regular_total}"
+        + (f"   (contingency: {contingency_hit}/{contingency_total})"
+           if contingency_total else ""),
         f"Folders going to {SORT_EXTRAS_NAME}: {len(extras_folders)}",
     ]
     if unfound_pois:
         summary_lines.append("")
-        summary_lines.append(f"Missed POIs / Checklist Items ({len(unfound_pois)}):")
-        MAX_LISTED = 14  # keep the dialog a sane height on big shoots
+        summary_lines.append(f"Missed ({len(unfound_pois)}):")
+        MAX_LISTED = 12  # keep the dialog a sane height on big shoots
         for name in unfound_pois[:MAX_LISTED]:
-            summary_lines.append(f"  \u2022 {name} was missed.")
+            summary_lines.append(f"  \u2022 {name}")
         if len(unfound_pois) > MAX_LISTED:
             summary_lines.append(f"  ...and {len(unfound_pois) - MAX_LISTED}"
                                  f" more (full list in the log).")
     else:
-        summary_lines.append("Missed POIs / Checklist Items: none --"
-                             " every POI in the notes has footage.")
+        summary_lines.append("")
+        summary_lines.append("Missed: none -- every checklist item has footage.")
+
+    summary_lines.append("")
+    if flagged:
+        summary_lines.append(f"Check Permissions ({len(flagged)} flagged"
+                             f" with * ):")
+        for entry in flagged[:10]:
+            summary_lines.append(f"  \u2022 {entry}")
+        if len(flagged) > 10:
+            summary_lines.append(f"  ...and {len(flagged) - 10} more"
+                                 f" (full list in the log).")
+        summary_lines.append("  Permission details may also be in the"
+                             " shoot notes themselves.")
+        log(f"Check Permissions -- {len(flagged)} folder(s) flagged with *:")
+        for entry in flagged:
+            log("  " + entry.replace("\n", " "))
+    else:
+        summary_lines.append("Check Permissions: no folders flagged"
+                             " with * .")
+
+    if client == "expedia":
+        log("Expedia mode -- report only, no bins were moved.")
+        summary_dialog("Shoot Notes Report (Expedia)", summary_lines
+                       + ["", "REPORT ONLY -- Expedia mode never moves bins."])
+        return
 
     if params["preview"]:
         log("Preview only -- nothing was moved. Untick the preview box to"
