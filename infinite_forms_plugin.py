@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-08-29.1"
+BUILD_TAG = "2026-09-08.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -2900,6 +2900,59 @@ def summary_dialog(title, lines):
     release_log_widget()
 
 
+def _html_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+def report_dialog(title, header_lines, body_lines):
+    """Report popup for long output: header labels on top, then the full
+    body in a scrollable, selectable TextEdit -- so the whole report can
+    be copied and pasted elsewhere."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    body_html = ("<pre style=\"font-family: Menlo, Consolas, monospace;"
+                 " font-size: 12px; margin: 0;\">"
+                 + _html_escape("\n".join(body_lines)) + "</pre>")
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "ReportDlg",
+            "WindowTitle": title,
+            "Geometry": [220, 140, 560, 620],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 6},
+                [ui.Label({"Text": line, "WordWrap": True, "Weight": 0})
+                 for line in header_lines]
+                + [ui.TextEdit({"ID": "ReportText", "ReadOnly": True,
+                                "Weight": 1})]
+                + [ui.Label({"Text": "Select and copy freely -- the full"
+                                     " report is also in the panel log.",
+                             "Weight": 0}),
+                   ui.Button({"ID": "BtnReportOk", "Text": "OK",
+                              "Weight": 0})],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+    try:
+        ditems["ReportText"].HTML = body_html
+    except Exception:
+        ditems["ReportText"].Text = "\n".join(body_lines)
+
+    def on_ok(_ev):
+        dlg_disp.ExitLoop()
+
+    dlg.On.BtnReportOk.Clicked = on_ok
+    dlg.On.ReportDlg.Close = on_ok
+    hold_log_widget()
+    dlg.Show()
+    run_loop_resilient(dlg_disp, "report dialog")
+    dlg.Hide()
+    release_log_widget()
+
+
 def get_subfolder(parent, name):
     for sub in parent.GetSubFolderList():
         if sub.GetName() == name:
@@ -3057,22 +3110,14 @@ def on_clip_count(ev):
     for c, name in counts:
         log(f"  {c:5}  {name}")
 
-    summary_lines = [
+    header = [
         f"Destination: {dest_name}",
-        f"Locations counted: {len(counts)}",
-        f"Total clips: {total_clips}",
+        f"Locations counted: {len(counts)}   Total clips: {total_clips}"
+        + (f"   Average: {total_clips / len(counts):.0f}" if counts else ""),
+        "Full list, fewest clips first:",
     ]
-    if counts:
-        avg = total_clips / len(counts)
-        summary_lines.append(f"Average per location: {avg:.0f}")
-        summary_lines.append("")
-        summary_lines.append("Lowest counts -- worth a curious look:")
-        for c, name in counts[:10]:
-            summary_lines.append(f"  {c:5}  {name}")
-        if len(counts) > 10:
-            summary_lines.append(f"  ...full list of {len(counts)}"
-                                 f" locations in the log.")
-    summary_dialog("Clip Count", summary_lines)
+    body = [f"{c:>5}   {name}" for c, name in counts]
+    report_dialog("Clip Count", header, body)
 
 
 def sort_dialog(project, media_pool):
