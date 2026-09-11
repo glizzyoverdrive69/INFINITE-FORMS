@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-09-08.1"
+BUILD_TAG = "2026-09-11.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -326,7 +326,7 @@ PANEL = {"collapsed": False, "pinned": False}
 win = None
 items = None
 
-PANEL_FULL_SIZE = [480, 740]
+PANEL_FULL_SIZE = [480, 780]
 PANEL_COLLAPSED_SIZE = [480, 84]
 
 
@@ -373,6 +373,7 @@ def build_main_panel():
                             ui.Button({"ID": "BtnBinFinder", "Text": "Bin Finder"}),
                             ui.Button({"ID": "BtnClipCount", "Text": "Clip Count"}),
                             ui.Button({"ID": "BtnApplyClientColor", "Text": "Colour Grading Prep"}),
+                            ui.Button({"ID": "BtnMatchGrades", "Text": "Match Grades"}),
                             ui.Button({"ID": "BtnAssemble", "Text": "Mid/Short Form Assembly"}),
                             ui.Button({"ID": "BtnRenameTracks", "Text": "Rename Video & Audio Tracks"}),
                             ui.Button({"ID": "BtnAudioSync", "Text": "Replace Camera Audio"}),
@@ -431,6 +432,7 @@ def build_main_panel():
     win.On.BtnLowerThirds.Clicked = guard(on_lower_thirds)
     win.On.BtnAssemble.Clicked = guard(on_assemble)
     win.On.BtnApplyClientColor.Clicked = guard(on_apply_client_color)
+    win.On.BtnMatchGrades.Clicked = guard(on_match_grades)
     win.On.BtnRenameTracks.Clicked = guard(on_rename_tracks)
     win.On.BtnSortShootNotes.Clicked = guard(on_sort_shoot_notes)
     win.On.BtnBinFinder.Clicked = guard(on_bin_finder)
@@ -3016,6 +3018,356 @@ def count_clips_recursive(folder):
     for sub in folder.GetSubFolderList():
         total += count_clips_recursive(sub)
     return total
+
+
+MATCH_GRADES_RESET_COLOR = "Blue"   # every target clip first
+MATCH_GRADES_DONE_COLOR = "Lime"    # then the ones that received a grade
+MATCH_GRADES_MAX_TARGETS = 6
+MATCH_GRADES_NONE = "(none)"
+
+
+def _grade_source_key(timeline_item):
+    """Identity of a timeline item's source clip: the Media Pool item's
+    unique id where available, else its file path, else its name. Same
+    source -> same key, regardless of in/out points."""
+    try:
+        mpi = timeline_item.GetMediaPoolItem()
+    except Exception:
+        return None
+    if not mpi:
+        return None
+    try:
+        uid = mpi.GetUniqueId()
+        if uid:
+            return ("uid", uid)
+    except Exception:
+        pass
+    try:
+        path = mpi.GetClipProperty("File Path")
+        if path:
+            return ("path", path)
+    except Exception:
+        pass
+    try:
+        return ("name", mpi.GetName())
+    except Exception:
+        return None
+
+
+def _timeline_video_items(timeline):
+    items = []
+    try:
+        track_count = timeline.GetTrackCount("video")
+    except Exception:
+        return items
+    for track in range(1, int(track_count) + 1):
+        try:
+            items.extend(timeline.GetItemListInTrack("video", track) or [])
+        except Exception:
+            continue
+    return items
+
+
+def match_grades_dialog(names, n_targets, state):
+    """One MAIN dropdown, n_targets target dropdowns, and a + button that
+    asks for another slot. Resize() is a no-op in UIManager, so + is
+    implemented by rebuilding the dialog (the caller loops).
+    Returns ("run", main, targets, preview) | ("add", state) | ("cancel",)."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    result = {"action": ("cancel",)}
+
+    target_rows = []
+    for i in range(n_targets):
+        target_rows.append(ui.HGroup({"Spacing": 6, "Weight": 0}, [
+            ui.Label({"Text": f"Target {i + 1}", "Weight": 0.25}),
+            ui.ComboBox({"ID": f"MGTarget_{i}", "Weight": 0.75}),
+        ]))
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "MatchGradesDlg",
+            "WindowTitle": "Match Grades",
+            "Geometry": [220, 160, 500, 250 + 34 * n_targets],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.Label({"Text": "MAIN timeline (grades are copied"
+                                      " FROM this one)", "Weight": 0}),
+                    ui.ComboBox({"ID": "MGMainCombo", "Weight": 0}),
+                    ui.Label({"Text": "Target timelines (receive the"
+                                      " grades)", "Weight": 0}),
+                ]
+                + target_rows
+                + [
+                    ui.HGroup({"Spacing": 6, "Weight": 0}, [
+                        ui.Button({"ID": "BtnMGAdd", "Text": "+",
+                                   "Weight": 0.2}),
+                        ui.Label({"Text": "add another target",
+                                  "Weight": 0.8}),
+                    ]),
+                    ui.CheckBox({"ID": "MGPreview",
+                                 "Text": "Preview only (report matches,"
+                                         " change nothing)",
+                                 "Checked": state.get("preview", True),
+                                 "Weight": 0}),
+                    ui.Label({"ID": "MGWarn", "Text": "", "Weight": 0}),
+                    ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                        ui.Button({"ID": "BtnMGCancel", "Text": "Cancel"}),
+                        ui.Button({"ID": "BtnMGRun", "Text": "Match Grades"}),
+                    ]),
+                ],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+    for name in names:
+        ditems["MGMainCombo"].AddItem(name)
+    if state.get("main") in names:
+        ditems["MGMainCombo"].CurrentText = state["main"]
+    prior = state.get("targets", [])
+    for i in range(n_targets):
+        combo = ditems[f"MGTarget_{i}"]
+        combo.AddItem(MATCH_GRADES_NONE)
+        for name in names:
+            combo.AddItem(name)
+        if i < len(prior) and prior[i] in names:
+            combo.CurrentText = prior[i]
+
+    def read_state():
+        return {
+            "main": ditems["MGMainCombo"].CurrentText,
+            "targets": [ditems[f"MGTarget_{i}"].CurrentText
+                        for i in range(n_targets)],
+            "preview": bool(ditems["MGPreview"].Checked),
+        }
+
+    def on_run(_ev):
+        s = read_state()
+        main_name = s["main"]
+        targets = []
+        for t in s["targets"]:
+            if t and t != MATCH_GRADES_NONE and t != main_name \
+                    and t not in targets:
+                targets.append(t)
+        if not main_name:
+            ditems["MGWarn"].Text = "Pick a MAIN timeline."
+            return
+        if not targets:
+            ditems["MGWarn"].Text = ("Pick at least one target timeline"
+                                     " (different from MAIN).")
+            return
+        result["action"] = ("run", main_name, targets, s["preview"])
+        dlg_disp.ExitLoop()
+
+    def on_add(_ev):
+        if n_targets >= MATCH_GRADES_MAX_TARGETS:
+            ditems["MGWarn"].Text = (f"Maximum {MATCH_GRADES_MAX_TARGETS}"
+                                     f" targets.")
+            return
+        result["action"] = ("add", read_state())
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev):
+        dlg_disp.ExitLoop()
+
+    dlg.On.BtnMGRun.Clicked = on_run
+    dlg.On.BtnMGAdd.Clicked = on_add
+    dlg.On.BtnMGCancel.Clicked = on_cancel
+    dlg.On.MatchGradesDlg.Close = on_cancel
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "match grades dialog")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["action"]
+
+
+def ask_match_grades(project):
+    """Dialog loop: rebuild with one more target slot each time + is
+    pressed. Returns (main, targets, preview) or (None, None, None)."""
+    names = []
+    for i in range(1, int(project.GetTimelineCount()) + 1):
+        tl = project.GetTimelineByIndex(i)
+        if tl:
+            names.append(tl.GetName())
+    if len(names) < 2:
+        log("Match Grades needs at least two timelines in the project.")
+        return None, None, None
+    n_targets = 2
+    state = {"preview": True}
+    while True:
+        action = match_grades_dialog(names, n_targets, state)
+        if action[0] == "run":
+            return action[1], action[2], action[3]
+        if action[0] == "add":
+            state = action[1]
+            n_targets = min(n_targets + 1, MATCH_GRADES_MAX_TARGETS)
+            continue
+        return None, None, None
+
+
+def on_match_grades(ev):
+    project, _, media_pool = get_context()
+    if not project:
+        log("No project open.")
+        return
+
+    main_name, target_names, preview = ask_match_grades(project)
+    if not main_name:
+        log("Match Grades cancelled.")
+        return
+
+    timelines = {}
+    for i in range(1, int(project.GetTimelineCount()) + 1):
+        tl = project.GetTimelineByIndex(i)
+        if tl:
+            timelines[tl.GetName()] = tl
+    main_tl = timelines.get(main_name)
+    if not main_tl:
+        log(f"MAIN timeline '{main_name}' not found.")
+        return
+
+    # Index MAIN: source key -> first item in timeline order
+    main_index, main_counts = {}, {}
+    for item in _timeline_video_items(main_tl):
+        key = _grade_source_key(item)
+        if key is None:
+            continue
+        if key not in main_index:
+            main_index[key] = item
+        main_counts[key] = main_counts.get(key, 0) + 1
+    dupes = [main_index[k].GetName() for k, n in main_counts.items() if n > 1]
+
+    log(f"Match Grades -- MAIN '{main_name}': {len(main_index)} unique"
+        f" source clip(s) indexed.")
+    if dupes:
+        log(f"  Note: {len(dupes)} source(s) appear more than once in MAIN"
+            f" -- the FIRST instance's grade is used: {', '.join(dupes)}")
+
+    original_tl = project.GetCurrentTimeline()
+    report = []
+    total_lime = total_failed = total_suspect = 0
+    for tname in target_names:
+        target_tl = timelines.get(tname)
+        if not target_tl:
+            report.append(f"{tname}: NOT FOUND -- skipped")
+            continue
+        items = _timeline_video_items(target_tl)
+        matches, unmatched = {}, 0
+        for item in items:
+            key = _grade_source_key(item)
+            if key is None:
+                continue
+            if key in main_index:
+                matches.setdefault(key, []).append(item)
+            else:
+                unmatched += 1
+        n_match = sum(len(v) for v in matches.values())
+
+        if preview:
+            report.append(f"{tname}: {n_match} clip(s) would receive grades"
+                          f" ({len(matches)} unique source(s));"
+                          f" {unmatched} would stay {MATCH_GRADES_RESET_COLOR}")
+            continue
+
+        try:
+            project.SetCurrentTimeline(target_tl)
+        except Exception:
+            pass
+
+        # Step 1: every clip in the target back to the reset colour, so
+        # no stale Lime from an earlier run can lie.
+        for item in items:
+            try:
+                item.SetClipColor(MATCH_GRADES_RESET_COLOR)
+            except Exception:
+                pass
+
+        # Step 2: copy grades; Step 3: Lime only the verified copies
+        lime = failed = suspect = 0
+        for key, targets in matches.items():
+            src_item = main_index[key]
+            try:
+                ok = src_item.CopyGrades(targets)
+            except Exception:
+                ok = False
+            if not ok:
+                failed += len(targets)
+                continue
+            try:
+                src_nodes = src_item.GetNodeGraph().GetNumNodes()
+            except Exception:
+                src_nodes = 0
+            for t in targets:
+                verified = True
+                if src_nodes:
+                    try:
+                        dst_nodes = t.GetNodeGraph().GetNumNodes()
+                        if dst_nodes and dst_nodes < src_nodes:
+                            verified = False
+                    except Exception:
+                        pass
+                if verified:
+                    try:
+                        t.SetClipColor(MATCH_GRADES_DONE_COLOR)
+                    except Exception:
+                        pass
+                    lime += 1
+                else:
+                    suspect += 1
+        total_lime += lime
+        total_failed += failed
+        total_suspect += suspect
+        line = (f"{tname}: {lime} clip(s) graded and marked"
+                f" {MATCH_GRADES_DONE_COLOR}")
+        if failed:
+            line += f", {failed} FAILED (left {MATCH_GRADES_RESET_COLOR})"
+        if suspect:
+            line += (f", {suspect} suspect (fewer nodes than source,"
+                     f" left {MATCH_GRADES_RESET_COLOR})")
+        line += f"; {unmatched} untouched clip(s) set to {MATCH_GRADES_RESET_COLOR}"
+        report.append(line)
+        log("  " + line)
+
+    if original_tl:
+        try:
+            project.SetCurrentTimeline(original_tl)
+        except Exception:
+            pass
+
+    if preview:
+        body = list(report)
+        if dupes:
+            body += ["", "Sources appearing more than once in MAIN"
+                         " (first instance's grade used):"]
+            body += [f"  {d}" for d in dupes]
+        body += ["", "PREVIEW ONLY -- nothing was changed."]
+        report_dialog("Match Grades -- Preview",
+                      [f"MAIN timeline: {main_name}",
+                       f"Unique sources in MAIN: {len(main_index)}"], body)
+        return
+
+    for line in report:
+        log("  " + line)
+    lines = [
+        "DO NOT TOUCH THE LIMES",
+        "",
+        f"{MATCH_GRADES_DONE_COLOR} clips in the target timelines already"
+        f" carry their grade from '{main_name}'.",
+        f"{MATCH_GRADES_RESET_COLOR} clips still need grading.",
+        "",
+        f"{total_lime} clip(s) graded across {len(target_names)}"
+        f" timeline(s).",
+    ]
+    if total_failed or total_suspect:
+        lines.append(f"{total_failed} failed, {total_suspect} suspect --"
+                     f" details in the log.")
+    summary_dialog("DO NOT TOUCH THE LIMES", lines)
 
 
 def clip_count_dialog(media_pool):
