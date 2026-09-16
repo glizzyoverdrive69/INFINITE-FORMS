@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-09-11.1"
+BUILD_TAG = "2026-09-15.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -3211,6 +3211,112 @@ def ask_match_grades(project):
         return None, None, None
 
 
+LIME_ART = """\
+         ...-#******+=..
+        .-****++=++=+==++::
+      .-**++*+++:-:.=-==:=+---+.
+   .=.*#**+*=*+++**==::==*+**=-++.
+  .*+****+*+=--:---+-+**-++*+***+*.
+    =+++#++***+*++++#**+*###*#**##%=..... ....
+    +*#+**+##*###**++***#*==**#%@%-::---====--   ..
+    +*****+*#%%####%@%#%%%%#**%@. .-+++===-=+==++-=..
+   .++***##*####%#%@##%%##%#%@@..:====-:-==---=-+=+=-..
+    :+**#**##%@@@@@@@@@%%@%#@@. -==--====-==----=--=+--..
+    .++***#%@*.......*@@@@%@@+.:-+==++=====--==-===-:-=-...
+     .-*##-.. .:--:..  ..%@@@-::+=-=-=---==----==-=-+=+++-.
+      .=. .:*+*+=+==+*+=...@%=-:-+==-===-=:=+---====-======.
+     ..:+*+-====-=---==++-..:#*:.====+--===+=--=+=-===--=-:.
+    .=++-==+:--==+===+==----:-%*..:-===+==-=:=++==+===+==--.
+   ..=++-========-====-==++--:-%#: -=======++====+-=======:.
+ .:::-=====---=========++=+--=:-@@=. -=--==--===+========::.
+ :-+++=-=-====-=====+==--=+:-++:%@@@=...----===:=====-::..:
+.=-+==+===++=+-::==---====-:-++=:##@@@%=:..  .:..::....::.
+.:-=++==+=-=-:*%:====+=+++--=+=*++=+##@@@@@%*==--:--===:
+.:=+=+---=+===:-=++++=----:-++*+=@@#++**##%@@@@@@%*%@@@@
+.::=:==+++++++++===-=+++=:-+#**-*@@@%%@@@@%%%@@@@@@@@@@#
+:=:+++++==+++++=+++++=-=::+#*+*=@@@@@@@@@@@@@@%@@@@@%@@
+.--:+++-=++=-=+===-=++=..+#***==@@@@@@@@%@@%%@@@@@%@%
+ .:.::=+++=--=+=+==--..=##*#*=-@% @@#%@@%%%%%@@@#@
+  =-....-=+=+++++=:..=#%%##*=+@@@
+   @@-:... ......:=*@@@%#**%@@@%@+
+   @@@@@@@*====+*%%%%##%@@%@@@@%@
+    @@@@@@@@@@@@@@@@@@%@@@@@@@@@%
+     %@@@@@@@@@@@@@@@@@@@@@@@%%
+       @@@%%@@@@@@@@@@@@@%@%@
+            @%%%%%%%%@%@@
+"""
+
+
+def limes_dialog(main_name, total_lime, n_timelines, total_failed,
+                 total_suspect):
+    """The completion popup: the lime, a big centred headline, and the
+    two lines a new teammate needs. Falls back to the plain summary
+    dialog if this build's UIManager rejects any styling attribute."""
+    lines = [
+        f"{MATCH_GRADES_DONE_COLOR} clips already carry their grade from"
+        f" '{main_name}'.  {MATCH_GRADES_RESET_COLOR} clips still need"
+        f" grading.",
+        f"{total_lime} clip(s) graded across {n_timelines} timeline(s).",
+    ]
+    if total_failed or total_suspect:
+        lines.append(f"{total_failed} failed, {total_suspect} suspect --"
+                     f" details in the log.")
+    try:
+        dlg_disp = bmd.UIDispatcher(ui)
+        art_html = ("<pre style=\"font-family: Menlo, Consolas, monospace;"
+                    " font-size: 7px; line-height: 7px; margin: 0;"
+                    " color: #B7E36B;\">" + LIME_ART + "</pre>")
+        dlg = dlg_disp.AddWindow(
+            {
+                "ID": "LimesDlg",
+                "WindowTitle": "DO NOT TOUCH THE LIMES",
+                "Geometry": [240, 120, 520, 620],
+                "StyleSheet": PANEL_QSS,
+            },
+            [
+                ui.VGroup(
+                    {"Spacing": 10},
+                    [
+                        ui.TextEdit({"ID": "LimesArt", "ReadOnly": True,
+                                     "Weight": 1}),
+                        ui.Label({
+                            "Text": "DO NOT TOUCH THE LIMES",
+                            "Alignment": {"AlignHCenter": True,
+                                          "AlignVCenter": True},
+                            "Font": ui.Font({"PixelSize": 30, "Bold": True}),
+                            "Weight": 0,
+                        }),
+                    ]
+                    + [ui.Label({"Text": line, "WordWrap": True,
+                                 "Alignment": {"AlignHCenter": True},
+                                 "Weight": 0}) for line in lines]
+                    + [ui.Button({"ID": "BtnLimesOk", "Text": "OK",
+                                  "Weight": 0})],
+                )
+            ],
+        )
+        ditems = dlg.GetItems()
+        ditems["LimesArt"].HTML = art_html
+
+        def on_ok(_ev):
+            dlg_disp.ExitLoop()
+
+        dlg.On.BtnLimesOk.Clicked = on_ok
+        dlg.On.LimesDlg.Close = on_ok
+        hold_log_widget()
+        try:
+            dlg.Show()
+            run_loop_resilient(dlg_disp, "limes dialog")
+            dlg.Hide()
+        finally:
+            release_log_widget()
+    except Exception:
+        log_quiet("Styled LIMES dialog unavailable on this build --"
+                  " using plain dialog.")
+        summary_dialog("DO NOT TOUCH THE LIMES",
+                       ["DO NOT TOUCH THE LIMES", ""] + lines)
+
+
 def on_match_grades(ev):
     project, _, media_pool = get_context()
     if not project:
@@ -3243,8 +3349,27 @@ def on_match_grades(ev):
         main_counts[key] = main_counts.get(key, 0) + 1
     dupes = [main_index[k].GetName() for k, n in main_counts.items() if n > 1]
 
-    log(f"Match Grades -- MAIN '{main_name}': {len(main_index)} unique"
-        f" source clip(s) indexed.")
+    main_items = _timeline_video_items(main_tl)
+    n_no_source = sum(1 for it in main_items if _grade_source_key(it) is None)
+    log(f"Match Grades -- MAIN '{main_name}': {len(main_items)} video"
+        f" item(s), {len(main_index)} unique source clip(s) indexed"
+        + (f", {n_no_source} item(s) with no source clip (nested"
+           f" timelines, compound clips or generators)" if n_no_source else "")
+        + ".")
+    if not main_index:
+        msg = [
+            f"'{main_name}' has no clips with an identifiable source.",
+            "",
+            "That usually means it's built from nested timelines,"
+            " compound clips or rendered exports (a review timeline)"
+            " rather than the raw footage.",
+            "",
+            "Pick the actual cut as MAIN. Nothing was changed.",
+        ]
+        log("  Aborted -- MAIN has no gradable source clips; target"
+            " timelines were not touched.")
+        summary_dialog("Match Grades", msg)
+        return
     if dupes:
         log(f"  Note: {len(dupes)} source(s) appear more than once in MAIN"
             f" -- the FIRST instance's grade is used: {', '.join(dupes)}")
@@ -3352,22 +3477,8 @@ def on_match_grades(ev):
                        f"Unique sources in MAIN: {len(main_index)}"], body)
         return
 
-    for line in report:
-        log("  " + line)
-    lines = [
-        "DO NOT TOUCH THE LIMES",
-        "",
-        f"{MATCH_GRADES_DONE_COLOR} clips in the target timelines already"
-        f" carry their grade from '{main_name}'.",
-        f"{MATCH_GRADES_RESET_COLOR} clips still need grading.",
-        "",
-        f"{total_lime} clip(s) graded across {len(target_names)}"
-        f" timeline(s).",
-    ]
-    if total_failed or total_suspect:
-        lines.append(f"{total_failed} failed, {total_suspect} suspect --"
-                     f" details in the log.")
-    summary_dialog("DO NOT TOUCH THE LIMES", lines)
+    limes_dialog(main_name, total_lime, len(target_names),
+                 total_failed, total_suspect)
 
 
 def clip_count_dialog(media_pool):
