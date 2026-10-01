@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-09-22.2"
+BUILD_TAG = "2026-10-01.2"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -326,7 +326,7 @@ PANEL = {"collapsed": False, "pinned": False}
 win = None
 items = None
 
-PANEL_FULL_SIZE = [480, 780]
+PANEL_FULL_SIZE = [480, 820]
 PANEL_COLLAPSED_SIZE = [480, 84]
 
 
@@ -373,6 +373,7 @@ def build_main_panel():
                             ui.Button({"ID": "BtnBinFinder", "Text": "Bin Finder"}),
                             ui.Button({"ID": "BtnClipCount", "Text": "Clip Count"}),
                             ui.Button({"ID": "BtnApplyClientColor", "Text": "Colour Grading Prep"}),
+                            ui.Button({"ID": "BtnPhotogFolders", "Text": "Create Photographer Folders"}),
                             ui.Button({"ID": "BtnMatchGrades", "Text": "Match Grades"}),
                             ui.Button({"ID": "BtnAssemble", "Text": "Mid/Short Form Assembly"}),
                             ui.Button({"ID": "BtnRenameTracks", "Text": "Rename Video & Audio Tracks"}),
@@ -433,6 +434,7 @@ def build_main_panel():
     win.On.BtnAssemble.Clicked = guard(on_assemble)
     win.On.BtnApplyClientColor.Clicked = guard(on_apply_client_color)
     win.On.BtnMatchGrades.Clicked = guard(on_match_grades)
+    win.On.BtnPhotogFolders.Clicked = guard(on_create_photographer_folders)
     win.On.BtnRenameTracks.Clicked = guard(on_rename_tracks)
     win.On.BtnSortShootNotes.Clicked = guard(on_sort_shoot_notes)
     win.On.BtnBinFinder.Clicked = guard(on_bin_finder)
@@ -2746,7 +2748,9 @@ def parse_shoot_notes(docx_path):
             if pm and current_theme is not None and c1:
                 lines = [l for l in c1.splitlines() if l.strip()]
                 title = lines[0].strip()
-                cands = (_sc_explicit_folders(lines[1:])
+                explicit = _sc_explicit_folders(lines[1:])
+                strong = explicit + [title] + _sort_title_locations(title)
+                cands = (explicit
                          + _sort_title_locations(title)
                          + _sc_permission_venues(lines[1:])
                          + _sc_option_venues(lines[1:])
@@ -2762,6 +2766,7 @@ def parse_shoot_notes(docx_path):
                     "label": first_line,
                     "title": title,
                     "candidates": ordered,
+                    "strong": strong,
                     "permission": _extract_permission_note(lines),
                 })
     return destination, themes
@@ -2841,6 +2846,7 @@ def parse_bex_shoot_notes(docx_path):
                     "label": label,
                     "title": title or title_line,
                     "candidates": ordered,
+                    "strong": ([explicit] if explicit else []) + [title or title_line],
                     "permission": _extract_permission_note(lines),
                 })
     return destination, themes
@@ -2947,7 +2953,9 @@ def _sort_match_tier(folder_name, candidate):
         return 1
     for ft in toks_f:
         for ct in toks_c:
-            need = 0.80 if min(len(ft), len(ct)) >= 6 else 0.86
+            if min(len(ft), len(ct)) < 6:
+                continue  # 'marina' ~ 'maria' is noise, not a match
+            need = 0.80 if min(len(ft), len(ct)) >= 8 else 0.86
             if SequenceMatcher(None, ft, ct).ratio() >= need:
                 return 1
     return 0
@@ -2962,6 +2970,12 @@ def _sort_best_match(folder_name, themes, nbh_tokens=None):
     'Port de Soller Bay & Beach' on 'Soller')."""
     if _sort_norm(folder_name) in SORT_FOLDER_STOPLIST:
         return 0, None, None
+    # 'General Valletta', 'gozo general': area footage. It may join a POI
+    # only when the POI's OWN name (title or stated bin name) is inside
+    # it -- 'General Rabat' -> POI 'Rabat' -- never on a shared word or
+    # a shot-suggestion candidate, which would sweep a city's general
+    # footage into one POI folder.
+    is_general = "general" in _sort_norm(folder_name).split()
     all_nbh = set()
     if nbh_tokens:
         for toks in nbh_tokens.values():
@@ -2976,8 +2990,13 @@ def _sort_best_match(folder_name, themes, nbh_tokens=None):
                 SORT_EXTRA_GENERIC.clear()
                 SORT_EXTRA_GENERIC.update(base_extra | (all_nbh - own))
             for poi in theme["pois"]:
-                for cand in poi["candidates"]:
+                cand_list = poi["candidates"]
+                if is_general:
+                    cand_list = poi.get("strong") or poi["candidates"][:1]
+                for cand in cand_list:
                     tier = _sort_match_tier(folder_name, cand)
+                    if is_general and tier < 3:
+                        tier = 0
                     if tier == 0:
                         continue
                     # ties on tier break by whole-name similarity, so
@@ -3021,12 +3040,21 @@ def is_poi_folder(folder):
 
 def collect_poi_folders(container, out):
     """Depth-first: gather POI folders at any depth under a container,
-    skipping already-created Theme/EXTRAS folders on reruns."""
+    skipping already-created Theme/EXTRAS folders on reruns.
+
+    A folder carrying an area marker -- 'Valletta_33350111 (C)',
+    'Gozo Region (R)', 'Rochor (N)' -- is ALWAYS a container and is
+    traversed into, never matched. The structural test alone fails when
+    POI folders hold their clips directly (no photographer subfolder):
+    every POI is then a leaf, so the city folder above them looks like
+    a POI folder itself and the real POIs are never seen."""
     for child in container.GetSubFolderList():
         name = child.GetName()
         if name.startswith("Theme ") or name == SORT_EXTRAS_NAME:
             continue
-        if is_poi_folder(child) or is_leaf_folder(child):
+        if CONTAINER_MARKER_RE.search(name.strip()):
+            collect_poi_folders(child, out)
+        elif is_poi_folder(child) or is_leaf_folder(child):
             out.append(child)
         else:
             collect_poi_folders(child, out)
@@ -3167,7 +3195,7 @@ def try_set_folder_color(folder, color):
 #   "X (N)" "X (C)" "X (HLR)"  area containers -> always recurse into them
 PHOTOGRAPHER_FOLDER_RE = re.compile(r"^TM\s*[-\u2013]\s*.+\d{4}\s*$",
                                     re.IGNORECASE)
-CONTAINER_MARKER_RE = re.compile(r"\((N|C|HLR|NEI|MC)\)\s*$", re.IGNORECASE)
+CONTAINER_MARKER_RE = re.compile(r"\((N|C|R|HLR|NEI|MC)\)\s*$", re.IGNORECASE)
 
 
 def _is_photographer_folder(folder):
@@ -3689,6 +3717,178 @@ def on_match_grades(ev):
 
     limes_dialog(main_name, total_lime, len(target_names),
                  total_failed, total_suspect)
+
+
+PHOTOGRAPHER_FOLDER_TEMPLATE = "TM - PHOTOGRAPHER - MONTH YEAR"
+
+
+def _folders_with_direct_clips(folder, parent_label, out):
+    """Every folder below the destination that holds clips DIRECTLY and
+    is not itself a photographer folder. Returns [(folder, label, parent,
+    clips)]. Containers are walked through; a container with loose clips
+    of its own qualifies too (Comino_217909676 in the Malta tree)."""
+    for child in folder.GetSubFolderList():
+        name = child.GetName().strip()
+        if _is_photographer_folder(child):
+            continue
+        clips = child.GetClipList() or []
+        if clips:
+            out.append((child, name, parent_label, clips))
+        _folders_with_direct_clips(child, name, out)
+    return out
+
+
+def create_photographer_folders_dialog(media_pool):
+    """Returns (folder_name, dest_name, preview) or (None, None, None)."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    result = {"name": None, "dest": None, "preview": True}
+
+    root = media_pool.GetRootFolder()
+    raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER)
+    source_parent = raw_folder or root
+    dest_names = [f.GetName() for f in source_parent.GetSubFolderList()]
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "PhotogDlg",
+            "WindowTitle": "Create Photographer Folders",
+            "Geometry": [220, 200, 500, 250],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.Label({"Text": "Photographer folder name (created"
+                                      " under every location that holds"
+                                      " clips)", "WordWrap": True,
+                              "Weight": 0}),
+                    ui.LineEdit({"ID": "PhotogName",
+                                 "Text": PHOTOGRAPHER_FOLDER_TEMPLATE,
+                                 "Weight": 0}),
+                    ui.Label({"Text": f"Destination folder (inside"
+                                      f" {source_parent.GetName()})",
+                              "Weight": 0}),
+                    ui.ComboBox({"ID": "PhotogDestCombo", "Weight": 0}),
+                    ui.CheckBox({"ID": "PhotogPreview",
+                                 "Text": "Preview only (report, move"
+                                         " nothing)",
+                                 "Checked": True, "Weight": 0}),
+                    ui.Label({"ID": "PhotogWarn", "Text": "", "WordWrap": True,
+                              "Weight": 0}),
+                    ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                        ui.Button({"ID": "BtnPhotogCancel", "Text": "Cancel"}),
+                        ui.Button({"ID": "BtnPhotogRun", "Text": "Create"}),
+                    ]),
+                ],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+    for name in dest_names:
+        ditems["PhotogDestCombo"].AddItem(name)
+
+    def on_run(_ev):
+        name = (ditems["PhotogName"].Text or "").strip()
+        dest = ditems["PhotogDestCombo"].CurrentText
+        if not name or name == PHOTOGRAPHER_FOLDER_TEMPLATE:
+            ditems["PhotogWarn"].Text = ("Type the real folder name, e.g."
+                                         " TM - PAN - SEP 2026")
+            return
+        if not dest:
+            ditems["PhotogWarn"].Text = "No destination folder selected."
+            return
+        if not PHOTOGRAPHER_FOLDER_RE.match(name):
+            ditems["PhotogWarn"].Text = ("Note: house pattern is"
+                                         " 'TM - NAME - MON YEAR'. Click"
+                                         " Create again to use this name"
+                                         " anyway.")
+            if result.get("warned") != name:
+                result["warned"] = name
+                return
+        result["name"], result["dest"] = name, dest
+        result["preview"] = bool(ditems["PhotogPreview"].Checked)
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev):
+        dlg_disp.ExitLoop()
+
+    dlg.On.BtnPhotogRun.Clicked = on_run
+    dlg.On.BtnPhotogCancel.Clicked = on_cancel
+    dlg.On.PhotogDlg.Close = on_cancel
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "photographer folders dialog")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["name"], result["dest"], result["preview"]
+
+
+def on_create_photographer_folders(ev):
+    project, _, media_pool = get_context()
+    if not project:
+        log("No project open.")
+        return
+    name, dest_name, preview = create_photographer_folders_dialog(media_pool)
+    if not name:
+        log("Create Photographer Folders cancelled.")
+        return
+
+    root = media_pool.GetRootFolder()
+    raw_folder = find_folder_by_name(root, SORT_PARENT_FOLDER) or root
+    dest_folder = get_subfolder(raw_folder, dest_name)
+    if not dest_folder:
+        log(f"Destination folder '{dest_name}' not found.")
+        return
+
+    targets = _folders_with_direct_clips(dest_folder, dest_name, [])
+    root_loose = len(dest_folder.GetClipList() or [])
+    log(f"Create Photographer Folders -- '{name}' under '{dest_name}':"
+        f" {len(targets)} folder(s) hold clips directly"
+        + (f"; {root_loose} loose clip(s) sit at the destination root"
+           f" and are left alone" if root_loose else "") + ".")
+
+    rows, created, moved = [], 0, 0
+    for folder, label, parent, clips in targets:
+        existing = get_subfolder(folder, name)
+        if preview:
+            rows.append(f"{len(clips):>5}   {label}   [{parent}]"
+                        + ("   (folder already exists)" if existing else ""))
+            continue
+        target = existing or media_pool.AddSubFolder(folder, name)
+        if not target:
+            rows.append(f"{len(clips):>5}   {label}   [{parent}]   FAILED to create folder")
+            log(f"  FAILED creating '{name}' under '{label}'")
+            continue
+        if not existing:
+            created += 1
+        ok = False
+        try:
+            ok = bool(media_pool.MoveClips(list(clips), target))
+        except Exception:
+            ok = False
+        if ok:
+            moved += len(clips)
+            rows.append(f"{len(clips):>5}   {label}   [{parent}]")
+        else:
+            rows.append(f"{len(clips):>5}   {label}   [{parent}]   FAILED to move clips")
+            log(f"  FAILED moving {len(clips)} clip(s) in '{label}'")
+
+    total_clips = sum(len(c) for _, _, _, c in targets)
+    for r in rows:
+        log("  " + r)
+    if preview:
+        header = [f"Would create '{name}' under {len(targets)} location(s)"
+                  f" and move {total_clips} clip(s).",
+                  "PREVIEW ONLY -- nothing was changed."]
+    else:
+        header = [f"Created {created} folder(s) named '{name}',"
+                  f" moved {moved} of {total_clips} clip(s).",
+                  "Clips   Location   [area]"]
+        log(f"Done. {created} folder(s) created, {moved} clip(s) moved.")
+    report_dialog("Create Photographer Folders", header, rows)
 
 
 def clip_count_dialog(media_pool):
