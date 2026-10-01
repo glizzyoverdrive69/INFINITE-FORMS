@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-09-15.1"
+BUILD_TAG = "2026-09-22.2"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -1708,10 +1708,24 @@ def extract_row5_locations(docx_path):
     return []
 
 
+# Letters with no Unicode decomposition: NFKD + ascii-ignore would DELETE
+# them ("Hagar Qim" with a Maltese H-bar became "agar qim"). Map first.
+_FOLD_TABLE = str.maketrans({
+    "\u0126": "H", "\u0127": "h",      # Maltese H-bar
+    "\u00df": "ss",                     # German sharp s
+    "\u0141": "L", "\u0142": "l",      # Polish l-stroke
+    "\u00d8": "O", "\u00f8": "o",      # Nordic o-slash
+    "\u0110": "D", "\u0111": "d",      # d-stroke
+    "\u00c6": "AE", "\u00e6": "ae", "\u0152": "OE", "\u0153": "oe",
+    "\u0131": "i", "\u00de": "Th", "\u00fe": "th", "\u00d0": "D", "\u00f0": "d",
+})
+
+
 def _fold_accents(text):
     """Fold accents so non-English or accent-drifted names match their
     ascii-typed counterparts (Menilmontant matches the accented form)."""
     try:
+        text = text.translate(_FOLD_TABLE)
         return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     except Exception:
         return text
@@ -2588,6 +2602,121 @@ def _sort_candidate_locations(lines):
     return out
 
 
+SC_FOLDER_NAME_RE = re.compile(
+    r"(?:Folder|Location)\s*Name\s*:\s*([^,)]+)", re.IGNORECASE)
+SC_PERMISSION_HEADER_RE = re.compile(
+    r"^permissions?\s*[-:\u2013]\s*(.+)$", re.IGNORECASE)
+SC_TEMPLATE_PLACEHOLDERS = {"poi parent parent", "sst",
+                            "name of location maps hyperlink"}
+# Trailing prose sections: their content is never a location name. They
+# end at the next structural header.
+SC_PROSE_SECTION_RE = re.compile(r"^(timing consideration|notes?\s*:?\s*$|notes?\s*:)",
+                                 re.IGNORECASE)
+SC_STRUCTURE_RE = re.compile(
+    r"^(folder structure|sub[\s-]*locations?|shot suggestions?|options\b"
+    r"|permissions?\b|lat\s*/\s*long)", re.IGNORECASE)
+
+
+def _sc_explicit_folders(lines):
+    """Every bin name the writer stated, in document order -- the most
+    authoritative candidates in the cell. Finished notes give one per
+    POI and one per sub-location: 'Folder Structure: (Folder Name:
+    !Musikverein, Located In: Innere Stadt (N))', 'Location Name:
+    Orangery_2066'. A filled-in slash path ('Upper Barrakka Gardens /
+    Valletta / Malta') contributes its first segment. Placeholders like
+    'POI / Parent / Parent' and '(SST)' contribute nothing."""
+    out = []
+    for i, line in enumerate(lines):
+        for m in SC_FOLDER_NAME_RE.finditer(line):
+            # Three filled forms seen so far:
+            #   Vienna:  'Folder Name: !Musikverein, Located In: X (N))'
+            #   Malta:   'Folder Name: City Gate / Valletta (C) / Malta)'
+            #   plain:   'Folder Name: Orangery_206686620'
+            # The bin is always the part before the first ',' or '/'.
+            tail = line[m.start(1):]
+            name = re.split(r"[,/]", tail, 1)[0].strip()
+            # drop the field's own closing ')' but keep a name's '(C)'
+            while name.endswith(")") and name.count(")") > name.count("("):
+                name = name[:-1].strip()
+            if name and _sort_norm(name) not in SC_TEMPLATE_PLACEHOLDERS:
+                out.append(name)
+        if line.strip().lower().startswith("folder structure") \
+                and not SC_FOLDER_NAME_RE.search(line):
+            inline = line.split(":", 1)[1].strip() if ":" in line else ""
+            value = inline if inline and inline.upper() != "(SST)" else (
+                lines[i + 1].strip() if i + 1 < len(lines) else "")
+            if "/" in value and not SC_FOLDER_NAME_RE.search(value) \
+                    and _sort_norm(value.replace("/", " ")) not in SC_TEMPLATE_PLACEHOLDERS:
+                first = value.split("/", 1)[0].strip()
+                if first and _sort_norm(first) not in ("poi", "sst"):
+                    out.append(first)
+    return out
+
+
+def _sc_permission_venues(lines):
+    """'Permissions - Cafe Sperl' headers name the venue being shot."""
+    out = []
+    for line in lines:
+        m = SC_PERMISSION_HEADER_RE.match(line.strip())
+        if m:
+            venue = m.group(1).strip()
+            if venue and len(venue.split()) <= 6:
+                out.append(venue)
+    return out
+
+
+def _sc_option_venues(lines):
+    """'OPTIONS (in priority order):' lists real venues (one gets shot and
+    named as the bin). Each line up to its first '(' is a candidate."""
+    out, active = [], False
+    for line in lines:
+        t = line.strip()
+        if re.match(r"^options\b", t, re.IGNORECASE):
+            active = True
+            continue
+        if active:
+            if SC_STRUCTURE_RE.match(t) or SC_PROSE_SECTION_RE.match(t):
+                break
+            head = t.split("(", 1)[0].strip().rstrip(":").strip()
+            if head and len(head.split()) <= 8:
+                out.append(head)
+    return out
+
+
+def _is_permission_form_line(line):
+    if ":" not in line:
+        return False
+    return line.split(":", 1)[0].strip().lower() in PERMISSION_FORM_FIELDS
+
+
+def _sc_strip_lines(lines):
+    """LINE-level cleanup, because finished notes interleave: each
+    sub-location carries its own Lat/Long line and its own permission
+    form, and the next sub-location name follows straight after. Drops
+    coordinates, permission headers and form fields, template
+    placeholders, and the trailing Timing/Notes prose. Everything else
+    passes through, so older notes parse as before."""
+    out, in_prose = [], False
+    for line in lines:
+        t = line.strip()
+        if SC_PROSE_SECTION_RE.match(t):
+            in_prose = True
+            continue
+        if SC_STRUCTURE_RE.match(t):
+            in_prose = False
+            continue  # section headers are never locations themselves
+        if in_prose or _is_permission_form_line(t):
+            continue
+        # final-notes metadata: SEO questions and which videos use the POI
+        if re.match(r"^(q|videos?)\s*:", t, re.IGNORECASE):
+            continue
+        norm = _sort_norm(t.replace("/", " ").replace("[", " ").replace("]", " "))
+        if norm in SC_TEMPLATE_PLACEHOLDERS:
+            continue
+        out.append(t)
+    return out
+
+
 def parse_shoot_notes(docx_path):
     """-> (destination, [{"num", "name", "pois": [{"label", "title",
     "candidates"}]}]) from the labelled two-column shoot-notes table."""
@@ -2617,8 +2746,11 @@ def parse_shoot_notes(docx_path):
             if pm and current_theme is not None and c1:
                 lines = [l for l in c1.splitlines() if l.strip()]
                 title = lines[0].strip()
-                cands = (_sort_title_locations(title)
-                         + _sort_candidate_locations(lines[1:]))
+                cands = (_sc_explicit_folders(lines[1:])
+                         + _sort_title_locations(title)
+                         + _sc_permission_venues(lines[1:])
+                         + _sc_option_venues(lines[1:])
+                         + _sort_candidate_locations(_sc_strip_lines(lines[1:])))
                 seen, ordered = set(), []
                 for cand in cands:
                     if cand.lower() not in seen:
@@ -2737,19 +2869,49 @@ def _is_placeholder_title(title):
     return _sort_norm(title.replace("/", " ")) in PLACEHOLDER_TITLES
 
 
+PERMISSION_FORM_FIELDS = ("name", "contact", "contact email", "email",
+                          "phone", "appointment date", "appointment time",
+                          "access notes", "status")
+
+
 def _extract_permission_note(lines):
     """First meaningful permission line from a POI/checklist cell --
     either a sentence containing 'permission', or the line following a
-    bare 'Permissions' label."""
+    bare 'Permissions' label. The newer Skyscanner template puts a FORM
+    under a bare 'Permissions' header (Name: / Contact email: /
+    Appointment Date: ...): only FILLED fields are reported, and an empty
+    form means no permission note at all."""
     for i, line in enumerate(lines):
         t = line.strip()
-        if "permission" in t.lower():
-            if len(t) > 14:
-                return t[:110]
-            for follow in lines[i + 1:i + 3]:
+        low = t.lower()
+        if "permission" not in low:
+            continue
+        if re.match(r"^permissions?\s*$", low):
+            filled, saw_form = [], False
+            for follow in lines[i + 1:i + 9]:
                 f = follow.strip()
-                if f and len(f) > 5:
-                    return f[:110]
+                if ":" not in f:
+                    break
+                key, val = f.split(":", 1)
+                if key.strip().lower() not in PERMISSION_FORM_FIELDS:
+                    break
+                saw_form = True
+                if val.strip():
+                    filled.append((key.strip(), " ".join(val.split())))
+            if saw_form:
+                if filled:
+                    # what the editor needs first: who, when, how in
+                    rank = {"name": 0, "appointment date": 1,
+                            "appointment time": 2, "access notes": 3}
+                    filled.sort(key=lambda kv: rank.get(kv[0].lower(), 9))
+                    return "; ".join(f"{k}: {v}" for k, v in filled)[:160]
+                continue  # empty form -- keep looking elsewhere in the cell
+        if len(t) > 14:
+            return t[:110]
+        for follow in lines[i + 1:i + 3]:
+            f = follow.strip()
+            if f and len(f) > 5:
+                return f[:110]
     return None
 
 
@@ -3000,15 +3162,40 @@ def try_set_folder_color(folder, color):
     return False
 
 
-def collect_clip_count_folders(container, out):
-    """Depth-first: gather POI folders at any depth, TRAVERSING INTO
-    Theme/EXTRAS containers -- unlike the sort collector, Clip Count must
-    see inside an already-sorted destination."""
+# House conventions the Clip Count walker keys on:
+#   "TM - IAN 2024"  photographer/year folder -> holds clips, never a location
+#   "X (N)" "X (C)" "X (HLR)"  area containers -> always recurse into them
+PHOTOGRAPHER_FOLDER_RE = re.compile(r"^TM\s*[-\u2013]\s*.+\d{4}\s*$",
+                                    re.IGNORECASE)
+CONTAINER_MARKER_RE = re.compile(r"\((N|C|HLR|NEI|MC)\)\s*$", re.IGNORECASE)
+
+
+def _is_photographer_folder(folder):
+    return PHOTOGRAPHER_FOLDER_RE.match(folder.GetName().strip()) is not None
+
+
+def collect_clip_count_rows(container, container_name, out):
+    """Depth-first over the destination. A folder is a LOCATION when it
+    holds nothing but photographer folders (or nothing at all); it is a
+    CONTAINER when it holds any other folder or carries an area marker.
+    Photographer folders sitting directly inside a container are that
+    container's loose footage and get one aggregated row.
+    Rows: (clip_count, label, parent_container_name)."""
+    loose = len(container.GetClipList() or [])
     for child in container.GetSubFolderList():
-        if is_poi_folder(child) or is_leaf_folder(child):
-            out.append(child)
+        name = child.GetName().strip()
+        if _is_photographer_folder(child):
+            loose += count_clips_recursive(child)
+            continue
+        subs = child.GetSubFolderList()
+        has_location_children = any(not _is_photographer_folder(s)
+                                    for s in subs)
+        if has_location_children or CONTAINER_MARKER_RE.search(name):
+            collect_clip_count_rows(child, name, out)
         else:
-            collect_clip_count_folders(child, out)
+            out.append((count_clips_recursive(child), name, container_name))
+    if loose:
+        out.append((loose, f"{container_name} -- loose footage", ""))
     return out
 
 
@@ -3247,6 +3434,18 @@ LIME_ART = """\
 """
 
 
+def _lime_art_html():
+    """Centre the art: every line padded to the same width, then each
+    line centred as its own pre-formatted paragraph -- equal widths
+    mean the drawing keeps its shape while the block sits centred."""
+    lines = LIME_ART.rstrip("\n").splitlines()
+    width = max(len(l) for l in lines)
+    style = ("white-space: pre; margin: 0; font-family: Menlo, Consolas,"
+             " monospace; font-size: 7px; line-height: 7px; color: #B7E36B;")
+    return "".join(f'<p align="center" style="{style}">{l.ljust(width)}</p>'
+                   for l in lines)
+
+
 def limes_dialog(main_name, total_lime, n_timelines, total_failed,
                  total_suspect):
     """The completion popup: the lime, a big centred headline, and the
@@ -3263,9 +3462,7 @@ def limes_dialog(main_name, total_lime, n_timelines, total_failed,
                      f" details in the log.")
     try:
         dlg_disp = bmd.UIDispatcher(ui)
-        art_html = ("<pre style=\"font-family: Menlo, Consolas, monospace;"
-                    " font-size: 7px; line-height: 7px; margin: 0;"
-                    " color: #B7E36B;\">" + LIME_ART + "</pre>")
+        art_html = _lime_art_html()
         dlg = dlg_disp.AddWindow(
             {
                 "ID": "LimesDlg",
@@ -3413,38 +3610,51 @@ def on_match_grades(ev):
             except Exception:
                 pass
 
-        # Step 2: copy grades; Step 3: Lime only the verified copies
+        # Step 2: copy grades (a failed batch retries clip by clip, so
+        # one bad clip can't sink its siblings); Step 3: Lime EVERY clip
+        # CopyGrades reported success on. The node-count check is
+        # advisory only -- it logs names, it never withholds the Lime.
         lime = failed = suspect = 0
+        suspect_names = []
         for key, targets in matches.items():
             src_item = main_index[key]
             try:
                 ok = src_item.CopyGrades(targets)
             except Exception:
                 ok = False
+            copied = list(targets) if ok else []
             if not ok:
-                failed += len(targets)
-                continue
+                for t in targets:
+                    try:
+                        if src_item.CopyGrades([t]):
+                            copied.append(t)
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
             try:
                 src_nodes = src_item.GetNodeGraph().GetNumNodes()
             except Exception:
                 src_nodes = 0
-            for t in targets:
-                verified = True
+            for t in copied:
+                try:
+                    t.SetClipColor(MATCH_GRADES_DONE_COLOR)
+                except Exception:
+                    pass
+                lime += 1
                 if src_nodes:
                     try:
                         dst_nodes = t.GetNodeGraph().GetNumNodes()
                         if dst_nodes and dst_nodes < src_nodes:
-                            verified = False
+                            suspect += 1
+                            suspect_names.append(t.GetName())
                     except Exception:
                         pass
-                if verified:
-                    try:
-                        t.SetClipColor(MATCH_GRADES_DONE_COLOR)
-                    except Exception:
-                        pass
-                    lime += 1
-                else:
-                    suspect += 1
+        if suspect_names:
+            log(f"  {tname}: {len(suspect_names)} clip(s) report fewer"
+                f" nodes than their MAIN source (marked Lime anyway --"
+                f" worth an eyeball): {', '.join(suspect_names[:12])}"
+                + (" ..." if len(suspect_names) > 12 else ""))
         total_lime += lime
         total_failed += failed
         total_suspect += suspect
@@ -3453,8 +3663,8 @@ def on_match_grades(ev):
         if failed:
             line += f", {failed} FAILED (left {MATCH_GRADES_RESET_COLOR})"
         if suspect:
-            line += (f", {suspect} suspect (fewer nodes than source,"
-                     f" left {MATCH_GRADES_RESET_COLOR})")
+            line += f", {suspect} flagged suspect in the log"
+
         line += f"; {unmatched} untouched clip(s) set to {MATCH_GRADES_RESET_COLOR}"
         report.append(line)
         log("  " + line)
@@ -3563,24 +3773,27 @@ def on_clip_count(ev):
         return
 
     log(f"Counting clips per location under '{dest_name}'...")
-    poi_folders = collect_clip_count_folders(dest_folder, [])
-    counts = [(count_clips_recursive(f), f.GetName().strip()) for f in poi_folders]
-    counts.sort(key=lambda pair: (pair[0], pair[1].lower()))
-    total_clips = sum(c for c, _ in counts)
+    rows = collect_clip_count_rows(dest_folder, dest_name, [])
+    rows.sort(key=lambda r: (r[0], r[1].lower()))
+    total_clips = sum(r[0] for r in rows)
+    n_locations = sum(1 for r in rows if not r[1].endswith("-- loose footage"))
 
-    log(f"Clip Count -- {dest_name}: {len(counts)} location(s),"
+    def fmt(row):
+        c, label, parent = row
+        return f"{c:>5}   {label}" + (f"   [{parent}]" if parent else "")
+
+    log(f"Clip Count -- {dest_name}: {n_locations} location(s),"
         f" {total_clips} clip(s). Fewest first:")
-    for c, name in counts:
-        log(f"  {c:5}  {name}")
+    for row in rows:
+        log("  " + fmt(row))
 
     header = [
         f"Destination: {dest_name}",
-        f"Locations counted: {len(counts)}   Total clips: {total_clips}"
-        + (f"   Average: {total_clips / len(counts):.0f}" if counts else ""),
-        "Full list, fewest clips first:",
+        f"Locations: {n_locations}   Total clips: {total_clips}"
+        + (f"   Average: {total_clips / n_locations:.0f}" if n_locations else ""),
+        "Fewest first. [brackets] = the area the location sits in.",
     ]
-    body = [f"{c:>5}   {name}" for c, name in counts]
-    report_dialog("Clip Count", header, body)
+    report_dialog("Clip Count", header, [fmt(r) for r in rows])
 
 
 def sort_dialog(project, media_pool):
