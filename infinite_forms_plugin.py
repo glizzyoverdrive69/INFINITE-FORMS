@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-10-09.1"
+BUILD_TAG = "2026-10-09.2"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -7274,28 +7274,48 @@ def on_bin_finder(ev):
 # file is backed up alongside, the swap is atomic, and what landed is
 # re-checked. Every failure offers the GitHub page instead.
 # ---------------------------------------------------------------------------
-UPDATE_STATE = {"available": False, "remote": "", "startup": None}
+UPDATE_STATE = {"available": False, "remote": "", "startup": None, "ref": None}
 UPDATE_MIN_BYTES = 50000                  # same floor as the installer
 UPDATE_EOF_SENTINEL = "# INFINITE-FORMS-EOF"
 UPDATE_BUILD_RE = re.compile(r'^BUILD_TAG = "([^"]+)"', re.MULTILINE)
 
 
-def _update_raw_url(filename):
-    # The throwaway query string gets past GitHub's ~5-minute raw-file
-    # cache, so a fresh release's VERSION and plugin file are read together
-    # instead of one new and one stale.
-    return (f"https://raw.githubusercontent.com/{UPDATE_REPO}/"
-            f"{UPDATE_BRANCH}/{filename}?nocache={int(time.time())}")
+def _update_raw_url(filename, ref=None):
+    """Raw URL of a repo file at `ref` -- by default the commit the version
+    check resolved (see _update_resolve_ref), else the branch."""
+    ref = ref or UPDATE_STATE.get("ref") or UPDATE_BRANCH
+    url = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{ref}/{filename}"
+    if ref == UPDATE_BRANCH:
+        # Branch files sit behind GitHub's ~5-minute cache; a throwaway
+        # query string makes a fresh cache entry more likely, not certain.
+        url += f"?nocache={int(time.time())}"
+    return url
 
 
-def _update_get(url, timeout):
+def _update_resolve_ref(timeout):
+    """The commit at the tip of UPDATE_BRANCH. VERSION and the plugin file
+    are then read from that one commit: a file at a commit never changes,
+    whereas right after a push GitHub's raw cache serves old and new copies
+    of the branch side by side for ~5 minutes (seen on release day: VERSION
+    old, plugin new). Falls back to the branch name when the API can't be
+    reached or is rate-limited (60 calls an hour per network)."""
+    status, data = _update_get(
+        f"https://api.github.com/repos/{UPDATE_REPO}/commits/{UPDATE_BRANCH}",
+        timeout, {"Accept": "application/vnd.github.sha"})
+    sha = data.decode("ascii", "replace").strip() if status == "ok" else ""
+    return sha if re.match(r"^[0-9a-f]{40}$", sha) else UPDATE_BRANCH
+
+
+def _update_get(url, timeout, headers=None):
     """GET a URL -> (status, bytes or None), status being "ok", "private"
     (HTTP 404), "certs" or "offline". Python's own HTTPS first; when that
     can't verify GitHub's certificate (a python.org Python whose
     certificates were never installed) curl gets a go, because it uses the
     system trust store like Safari does. Never raises."""
+    headers = headers or {}
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return "ok", response.read()
     except urllib.error.HTTPError as err:
         # HTTPError subclasses URLError, so it has to be caught first.
@@ -7308,10 +7328,12 @@ def _update_get(url, timeout):
     except Exception:
         status = "offline"
     if status == "certs":
+        command = ["curl", "-fsSL", "--max-time", str(int(timeout))]
+        for name, value in headers.items():
+            command += ["-H", f"{name}: {value}"]
         try:
-            done = subprocess.run(["curl", "-fsSL", "--max-time",
-                                   str(int(timeout)), url],
-                                  capture_output=True, timeout=timeout + 5)
+            done = subprocess.run(command + [url], capture_output=True,
+                                  timeout=timeout + 5)
             if done.returncode == 0:
                 return "ok", done.stdout
             if done.returncode == 22:       # curl -f: HTTP error, i.e. 404
@@ -7372,6 +7394,8 @@ def _fetch_remote_version(timeout):
     raises -- an update check must not be able to break anything."""
     if not UPDATE_REPO:
         return ("offline", None)
+    # Pin this check -- and any update it leads to -- to one commit.
+    UPDATE_STATE["ref"] = _update_resolve_ref(timeout)
     status, data = _update_get(_update_raw_url("VERSION"), timeout)
     if status != "ok":
         return (status, None)
@@ -7564,6 +7588,10 @@ def on_check_for_update(_ev=None):
     status, remote = _fetch_remote_version(8)
     message, title, lines = _update_result(status, remote)
     log(message)
+    if status == "ok" and remote and _update_compare(remote) == "newer":
+        # Keep the header button (if it was built) on this same release --
+        # the check just pinned UPDATE_STATE["ref"] to its commit.
+        UPDATE_STATE["remote"] = remote
     _update_show(status, remote, title, lines)
 
 

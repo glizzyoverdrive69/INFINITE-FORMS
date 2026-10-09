@@ -103,8 +103,13 @@ install the update in place:
 
 **Update now** downloads the plugin from GitHub and validates it before
 touching anything (size, full compile, end-of-file marker, and its
-`BUILD_TAG` matching `VERSION`, which catches GitHub still serving the
-previous file for a few minutes after a push). The previous version is kept
+`BUILD_TAG` matching `VERSION`). Both files are read from the exact commit
+at the tip of the branch, looked up through GitHub's API: for a few minutes
+after a push GitHub's raw-file cache serves old and new copies of a branch
+side by side, but a file at a commit never changes, so the version
+announced and the file installed always match. If the API is unreachable or
+rate-limited (60 calls an hour per network) it falls back to the branch,
+and the `BUILD_TAG` check refuses a stale file with "try again shortly". The previous version is kept
 as a `.bak` alongside, the swap is atomic, and the installed file is
 re-checked — a bad result is rolled back. Then close the panel and reopen it
 from Workspace > Scripts > Utility. If anything fails, the dialog offers
