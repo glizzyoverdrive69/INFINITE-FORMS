@@ -3761,7 +3761,9 @@ def on_match_grades(ev):
 XCHECK_LUT_TOLERANCE = 0.0005     # per LUT value; half a 10-bit code value
 XCHECK_CARD_SLOTS = 4             # variants shown side by side
 XCHECK_USES_LISTED = 6            # per card, before "...and N more"
-XCHECK_PREVIEW_BOX = (232, 130)   # preview size inside a card
+XCHECK_THUMB_MIN_W = 160          # previews grow with the window from here
+XCHECK_PICKER_GEOMETRY = (80, 60, 1240, 780)
+XCHECK_NAME_CHARS = 34            # longer timeline names are middle-elided
 XCHECK_SETTLE_SECONDS = 0.35      # let Resolve land on a frame before a grab
 XCHECK_VERSION_PREFIX = "Cross Check"
 # Source types that carry no grade worth comparing.
@@ -3937,8 +3939,8 @@ def _xcheck_tc_format(timeline):
 
 
 def _xcheck_timeline_info(use, ctx):
-    """Per-timeline facts the picker needs, read once: timecode format and
-    the preview size that fits the timeline's aspect ratio."""
+    """Per-timeline facts the picker needs, read once: timecode format,
+    aspect ratio, and when the timeline was created."""
     info = ctx["tl_info"].get(use["tl_name"])
     if info:
         return info
@@ -3951,12 +3953,39 @@ def _xcheck_timeline_info(use, ctx):
         width, height = 16.0, 9.0
     if width <= 0 or height <= 0:
         width, height = 16.0, 9.0
-    box_w, box_h = XCHECK_PREVIEW_BOX
-    scale = min(box_w / width, box_h / height)
-    info = {"base": base, "drop": drop,
-            "preview": (int(width * scale), int(height * scale))}
+    added, added_text = _xcheck_timeline_added(timeline)
+    info = {"base": base, "drop": drop, "aspect": width / height,
+            "added": added, "added_text": added_text}
     ctx["tl_info"][use["tl_name"]] = info
     return info
+
+
+def _xcheck_timeline_added(timeline):
+    """(epoch, "9 Oct 11:10") for when the timeline was created, from its
+    Media Pool "Date Added". Resolve leaves Date Modified/Created blank for
+    timelines and records no time for a grade, so this is the closest
+    thing to "newest" there is: each revision is a new timeline."""
+    try:
+        raw = timeline.GetMediaPoolItem().GetClipProperty("Date Added") or ""
+    except Exception:
+        return None, ""
+    try:
+        parsed = time.strptime(" ".join(raw.split()), "%a %b %d %Y %H:%M:%S")
+    except ValueError:
+        return None, raw
+    text = f"{parsed.tm_mday} {time.strftime('%b %H:%M', parsed)}"
+    if parsed.tm_year != time.localtime().tm_year:
+        text = f"{parsed.tm_mday} {time.strftime('%b %Y %H:%M', parsed)}"
+    return time.mktime(parsed), text
+
+
+def _xcheck_elide(name, limit=XCHECK_NAME_CHARS):
+    """Shorten from the middle, keeping the end -- where version numbers
+    and dates live in a timeline name."""
+    if len(name) <= limit:
+        return name
+    head = (limit - 1) // 2
+    return name[:head] + "…" + name[len(name) - (limit - 1 - head):]
 
 
 def _xcheck_use_label(use, ctx):
@@ -3966,6 +3995,21 @@ def _xcheck_use_label(use, ctx):
         where += " · " + _xcheck_frames_to_tc(use["start"], info["base"],
                                                    info["drop"])
     return where
+
+
+def _xcheck_use_lines(use, ctx):
+    """Two short lines for a card: the (shortened) timeline name, then
+    track, timecode and anything that stops it showing in the edit."""
+    info = _xcheck_timeline_info(use, ctx)
+    detail = f" V{use['track']}"
+    if use.get("start") is not None:
+        detail += " · " + _xcheck_frames_to_tc(use["start"], info["base"],
+                                                    info["drop"])
+    if use.get("clip_on") is False:
+        detail += " · clip disabled"
+    elif use.get("track_on") is False:
+        detail += " · track off"
+    return [_xcheck_elide(use["tl_name"]), detail]
 
 
 def _xcheck_timelines(project):
@@ -4075,6 +4119,7 @@ def _xcheck_build_conflict(variants, use_groups):
     letter them, note why each differs from A, and read the positions the
     picker shows -- only for shots that actually conflict."""
     variants.sort(key=lambda v: (_xcheck_is_ungraded(v["fp"]), -len(v["uses"])))
+    track_on = {}
     for index, variant in enumerate(variants):
         variant["letter"] = chr(65 + index) if index < 26 else f"#{index + 1}"
         variant["preview"] = None
@@ -4082,11 +4127,28 @@ def _xcheck_build_conflict(variants, use_groups):
         variant["reasons"] = (_xcheck_differences(variants[0]["fp"], variant["fp"],
                                                   use_groups) if index else [])
         for use in variant["uses"]:
-            for field, getter in (("start", "GetStart"), ("end", "GetEnd")):
+            for field, getter in (("start", "GetStart"), ("end", "GetEnd"),
+                                  ("src_start", "GetSourceStartFrame"),
+                                  ("src_end", "GetSourceEndFrame")):
                 try:
                     use[field] = int(getattr(use["item"], getter)())
                 except Exception:
                     use[field] = None
+            # A disabled clip (an alternate parked on V2, say) or a switched-
+            # off track still counts as a use, but the edit doesn't show it:
+            # previewing it would grab whatever is underneath instead.
+            try:
+                use["clip_on"] = bool(use["item"].GetClipEnabled())
+            except Exception:
+                use["clip_on"] = True
+            key = (use["tl_name"], use["track"])
+            if key not in track_on:
+                try:
+                    track_on[key] = bool(use["tl"].GetIsTrackEnabled(
+                        "video", use["track"]))
+                except Exception:
+                    track_on[key] = True
+            use["track_on"] = track_on[key]
     seen, split = {}, []
     for index, variant in enumerate(variants):
         for use in variant["uses"]:
@@ -4101,13 +4163,9 @@ def _xcheck_build_conflict(variants, use_groups):
 
 
 # --- Moving Resolve to a shot (previews, Show in Resolve) ------------------
-def _xcheck_clear_frame(use, ctx):
-    """(frame, covered): a frame inside this use where nothing opaque sits
-    on a higher track, so a preview shows THIS shot. covered=True means
-    every frame tried is hidden and the middle frame is returned anyway."""
-    start, end = use.get("start"), use.get("end")
-    if start is None or end is None or end <= start:
-        return None, True
+def _xcheck_cover_spans(use, ctx):
+    """[(start, end)] of everything opaque, enabled and on an enabled
+    track above this use -- what would hide it in the viewer."""
     timeline = use["tl"]
     spans = []
     for track, opaque in ctx["layers"].get(use["tl_name"], {}).items():
@@ -4123,17 +4181,79 @@ def _xcheck_clear_frame(use, ctx):
             if enabled:
                 for item in opaque:
                     try:
-                        track_spans.append((int(item.GetStart()), int(item.GetEnd())))
+                        if item.GetClipEnabled():
+                            track_spans.append((int(item.GetStart()),
+                                                int(item.GetEnd())))
                     except Exception:
                         pass
             ctx["spans"][cache_key] = track_spans
         spans.extend(ctx["spans"][cache_key])
+    return spans
+
+
+def _xcheck_clear_frame(use, ctx):
+    """(frame, covered): a frame inside this use where nothing opaque sits
+    on a higher track, so a preview shows THIS shot. covered=True means
+    every frame tried is hidden and the middle frame is returned anyway."""
+    start, end = use.get("start"), use.get("end")
+    if start is None or end is None or end <= start:
+        return None, True
+    spans = _xcheck_cover_spans(use, ctx)
     length = end - start
     for fraction in (0.5, 0.3, 0.7, 0.15, 0.85):
         frame = start + int(length * fraction)
         if not any(s <= frame < e for s, e in spans):
             return frame, False
     return start + length // 2, True
+
+
+def _xcheck_use_visible(use):
+    """Does this use actually show in its edit right now? Read live -- an
+    editor soloing tracks mid-review changes the answer."""
+    try:
+        if not use["item"].GetClipEnabled():
+            return False
+        return bool(use["tl"].GetIsTrackEnabled("video", use["track"]))
+    except Exception:
+        return True
+
+
+def _xcheck_preview_source(conflict):
+    """The source frame to preview every variant at, so the cards show the
+    same moment with different grades rather than different moments. It's
+    the frame inside a visible use of the most variants (ideally all)."""
+    if "preview_src" in conflict:
+        return conflict["preview_src"]
+    ranges = [(index, use["src_start"], use["src_end"])
+              for index, variant in enumerate(conflict["variants"])
+              for use in variant["uses"]
+              if use.get("src_start") is not None
+              and use.get("src_end") is not None
+              and use.get("clip_on", True) and use.get("track_on", True)]
+    candidates = {(a + b) // 2 for _, a, b in ranges}
+    for i, (vi, a1, b1) in enumerate(ranges):
+        for vj, a2, b2 in ranges[i + 1:]:
+            low, high = max(a1, a2), min(b1, b2)
+            if vi != vj and low <= high:
+                candidates.add((low + high) // 2)
+    best = None
+    if candidates:
+        best = max(sorted(candidates), key=lambda s: len(
+            {vi for vi, a, b in ranges if a <= s <= b}))
+    conflict["preview_src"] = best
+    return best
+
+
+def _xcheck_frame_for_source(use, source_frame):
+    """Timeline frame showing `source_frame` of this use, or None if the
+    use doesn't contain it. Scales for speed changes."""
+    s0, s1 = use.get("src_start"), use.get("src_end")
+    t0, t1 = use.get("start"), use.get("end")
+    if None in (s0, s1, t0, t1, source_frame) or not s0 <= source_frame <= s1:
+        return None
+    span = max(1, s1 - s0)
+    frame = t0 + int(round((source_frame - s0) * max(0, t1 - 1 - t0) / span))
+    return max(t0, min(frame, t1 - 1))
 
 
 def _xcheck_park(project, use, ctx, frame=None):
@@ -4200,20 +4320,39 @@ def _xcheck_thumbnail_png(use, path):
     return True
 
 
-def _xcheck_grab_preview(project, variant, ctx):
-    """Export the current frame of one use of this variant as its preview.
-    Tries up to three uses, skipping any hidden under a clip above. A
-    variant that can't be previewed is marked "" so it isn't retried."""
+def _xcheck_grab_preview(project, conflict, variant, ctx):
+    """Export the frame Resolve shows for one use of this variant as its
+    preview. Only uses that are visible in their edit qualify -- grabbing a
+    disabled clip's frame captured the clip underneath it (a different
+    shot). Prefers the conflict's shared source frame so all cards show the
+    same moment. A variant that can't be previewed is marked "" with the
+    reason in preview_why, so it isn't retried."""
     if variant.get("preview") is not None:
         return
     variant["preview"] = ""
-    for use in variant["uses"][:3]:
-        frame, covered = _xcheck_clear_frame(use, ctx)
-        if frame is None or covered:
-            continue
+    visible = [use for use in variant["uses"] if _xcheck_use_visible(use)]
+    if not visible:
+        variant["preview_why"] = ("Disabled clip or track in every timeline"
+                                  " -- nothing on screen to preview.")
+        return
+    variant["preview_why"] = "Hidden under a clip above, or the grab failed."
+    source_frame = _xcheck_preview_source(conflict)
+    # Uses that contain the shared frame first, then any other visible use.
+    visible.sort(key=lambda u: _xcheck_frame_for_source(u, source_frame) is None)
+    for use in visible[:3]:
+        frame = _xcheck_frame_for_source(use, source_frame)
+        same = frame is not None and not any(
+            s <= frame < e for s, e in _xcheck_cover_spans(use, ctx))
+        if not same:
+            frame, covered = _xcheck_clear_frame(use, ctx)
+            if frame is None or covered:
+                continue
+        switching = project.GetCurrentTimeline() is None or (
+            project.GetCurrentTimeline().GetUniqueId() != use["tl"].GetUniqueId())
         if not _xcheck_park(project, use, ctx, frame):
             continue
-        time.sleep(XCHECK_SETTLE_SECONDS)
+        # A timeline switch takes longer to land than a playhead move.
+        time.sleep(XCHECK_SETTLE_SECONDS * (2 if switching else 1))
         ctx["seq"] += 1
         # Unique names: Qt caches images by path, and a reused path would
         # show the previous shot.
@@ -4230,7 +4369,8 @@ def _xcheck_grab_preview(project, variant, ctx):
             if _xcheck_thumbnail_png(use, stem + "_thumb.png"):
                 variant["preview"] = stem + "_thumb.png"
         if variant["preview"]:
-            variant["preview_size"] = _xcheck_timeline_info(use, ctx)["preview"]
+            variant["preview_aspect"] = _xcheck_timeline_info(use, ctx)["aspect"]
+            variant["preview_same"] = same
             return
 
 
@@ -4548,60 +4688,95 @@ def xcheck_select_dialog(names, ticked, use_groups):
     return result["value"]
 
 
-def _xcheck_tool_summary(signature):
+def _xcheck_tool_summary(signature, width=None):
+    """The distinct tools in a grade, mixers left out. With a width, a list
+    of lines broken between tool names, never inside one."""
     seen = []
     for node in signature or ():
         for tool in node:
             if "Mixer" not in tool and tool not in seen:
                 seen.append(tool)
     if len(seen) > 6:
-        return ", ".join(seen[:6]) + f" +{len(seen) - 6} more"
-    return ", ".join(seen)
+        seen = seen[:6] + [f"+{len(seen) - 6} more"]
+    if width is None:
+        return ", ".join(seen)
+    lines = []
+    for tool in seen:
+        if lines and len(lines[-1]) + len(tool) + 2 <= width:
+            lines[-1] += ", " + tool
+        else:
+            lines.append(tool)
+    return lines
 
 
-def _xcheck_variant_html(variant, chosen, use_groups, ctx):
+def _xcheck_newest(variant, ctx):
+    """Creation time of the newest timeline this variant is used in."""
+    stamps = [_xcheck_timeline_info(u, ctx)["added"] for u in variant["uses"]]
+    stamps = [s for s in stamps if s is not None]
+    return max(stamps) if stamps else None
+
+
+def _xcheck_variant_html(variant, chosen, newest, use_groups, ctx):
+    """(card HTML, line count). Every line is short and broken by hand --
+    a word-wrapped label in a layout clips its last lines on resize, which
+    is how a third timeline went missing from a card."""
     fp = variant["fp"]
+    grey = '<span style="color:#8A9384;">{}</span>'
+    warn = '<span style="color:#E8A06A;">{}</span>'
     head = (f'<span style="font-size:18px; color:#C4A253;">'
             f'<b>{variant["letter"]}</b></span>')
     if chosen:
         head += ' &nbsp;<span style="color:#B7E36B;"><b>✓ CHOSEN</b></span>'
+    if newest:
+        head += (' &nbsp;<span style="color:#7FC8E8;"><b>NEWEST'
+                 ' TIMELINE</b></span>')
     if _xcheck_is_ungraded(fp):
-        look = ('<span style="color:#E8A06A;"><b>UNGRADED</b></span>'
-                ' -- empty node tree')
+        look = warn.format("<b>UNGRADED</b>") + " -- empty node tree"
     else:
         look = f"{fp['nodes']} node(s)"
     if fp["lut"] is None:
-        look += ' <span style="color:#E8A06A;">(colour unreadable)</span>'
+        look += " " + warn.format("(colour unreadable)")
     lines = [head, look]
     if use_groups:
         lines.append("Group: " + _html_escape(fp["group"] or "none"))
     else:
         groups = sorted({u.get("group") or "none" for u in variant["uses"]})
         lines.append("Group: " + _html_escape(", ".join(groups)))
-    tools = _xcheck_tool_summary(fp["tools"])
-    if tools:
-        lines.append(f'<span style="color:#8A9384;">{_html_escape(tools)}</span>')
+    for chunk in _xcheck_tool_summary(fp["tools"], width=40):
+        lines.append(grey.format(_html_escape(chunk)))
     if variant["reasons"]:
-        lines.append('<span style="color:#E8A06A;">Differs from A: '
-                     + ", ".join(variant["reasons"]) + "</span>")
+        lines.append(warn.format("Differs from A: "
+                                 + ", ".join(variant["reasons"])))
+    stamp = _xcheck_newest(variant, ctx)
+    if stamp is not None:
+        texts = [_xcheck_timeline_info(u, ctx)["added_text"]
+                 for u in variant["uses"]
+                 if _xcheck_timeline_info(u, ctx)["added"] == stamp]
+        lines.append(grey.format(f"Timeline created {texts[0]}"))
     lines.append(f"<b>Used {len(variant['uses'])}x:</b>")
     for use in variant["uses"][:XCHECK_USES_LISTED]:
-        lines.append(_html_escape(_xcheck_use_label(use, ctx)))
+        name, detail = _xcheck_use_lines(use, ctx)
+        lines.append(_html_escape(name))
+        lines.append(grey.format(_html_escape(detail)))
     extra = len(variant["uses"]) - XCHECK_USES_LISTED
     if extra > 0:
         lines.append(f"...and {extra} more")
-    return "<br>".join(lines)
+    return "<br>".join(lines), len(lines)
 
 
-def _xcheck_thumb_html(variant):
+def _xcheck_thumb_html(variant, width, same_frame_note):
     path = variant.get("preview")
     if path:
-        width, height = variant.get("preview_size") or XCHECK_PREVIEW_BOX
-        return f'<img src="{path}" width="{width}" height="{height}">'
+        height = int(width / (variant.get("preview_aspect") or 16 / 9.0))
+        html = f'<img src="{path}" width="{width}" height="{height}">'
+        if same_frame_note:
+            html += ('<br><span style="color:#E8A06A;">Different moment from'
+                     ' the other previews</span>')
+        return html
     if path == "":
-        return ('<span style="color:#8A9384;">No preview -- hidden under a'
-                ' clip above, or the grab failed.<br>Use Show in'
-                ' Resolve.</span>')
+        return ('<span style="color:#8A9384;">No preview: '
+                + _html_escape(variant.get("preview_why") or "grab failed.")
+                + '<br>Show in Resolve works for every variant.</span>')
     return '<span style="color:#8A9384;">No preview yet</span>'
 
 
@@ -4614,18 +4789,18 @@ def xcheck_picker(project, conflicts, ctx):
     coming back from the review screen picks up exactly where it was."""
     dlg_disp = bmd.UIDispatcher(ui)
     choices = ctx["choices"]
-    state = {"offset": 0, "apply": False, "ticks": 0, "closed": False}
-    box_w, box_h = XCHECK_PREVIEW_BOX
+    geometry = list(XCHECK_PICKER_GEOMETRY)
+    state = {"offset": 0, "apply": False, "ticks": 0, "closed": False,
+             "size": (geometry[2], geometry[3]), "rendered": None}
 
     cards = []
     for slot in range(XCHECK_CARD_SLOTS):
         cards.append(ui.VGroup({"ID": f"XPCard_{slot}", "Spacing": 4}, [
             ui.Label({"ID": f"XPThumb_{slot}", "Text": "", "Weight": 0,
-                      "MinimumSize": [box_w, box_h + 6],
+                      "MinimumSize": [XCHECK_THUMB_MIN_W, 96],
                       "Alignment": {"AlignHCenter": True,
                                     "AlignVCenter": True}}),
-            ui.Label({"ID": f"XPInfo_{slot}", "Text": "", "WordWrap": True,
-                      "Weight": 1,
+            ui.Label({"ID": f"XPInfo_{slot}", "Text": "", "Weight": 1,
                       "Alignment": {"AlignLeft": True, "AlignTop": True}}),
             ui.HGroup({"Spacing": 4, "Weight": 0}, [
                 ui.Button({"ID": f"BtnXPShow_{slot}", "Text": "Show in Resolve"}),
@@ -4637,8 +4812,14 @@ def xcheck_picker(project, conflicts, ctx):
         {
             "ID": "XCPickerDlg",
             "WindowTitle": "Colour Cross Check",
-            "Geometry": [120, 90, 1080, 640],
+            "Geometry": geometry,
+            # Below this the four cards no longer fit and the right-hand
+            # edge (tally, buttons) gets clipped.
+            "MinimumSize": [980, 620],
             "StyleSheet": PANEL_QSS,
+            # Resize drives the preview size; Close must stay listed once
+            # Events is given.
+            "Events": {"Close": True, "Resize": True},
         },
         [
             ui.VGroup(
@@ -4648,6 +4829,12 @@ def xcheck_picker(project, conflicts, ctx):
                         ui.Label({"ID": "XPHeader", "Text": "", "Weight": 1}),
                         ui.Label({"ID": "XPTally", "Text": "", "Weight": 0}),
                     ]),
+                    ui.Label({"Text": '<span style="color:#8A9384;">NEWEST'
+                                      ' TIMELINE marks the variant from the most'
+                                      ' recently created timeline -- Resolve'
+                                      ' doesn\'t record when a grade itself'
+                                      ' changed.</span>',
+                              "Weight": 0}),
                     # No WordWrap on these (see the timeline picker): the
                     # note carries its own <br>, and status gets a full row.
                     ui.Label({"ID": "XPNote", "Text": "", "Weight": 0}),
@@ -4674,7 +4861,8 @@ def xcheck_picker(project, conflicts, ctx):
                         ui.Label({"Text": "", "Weight": 1}),
                         ui.Button({"ID": "BtnXPCancel", "Text": "Cancel",
                                    "Weight": 0}),
-                        ui.Button({"ID": "BtnXPApply", "Text": "Review & Apply",
+                        # Not "&": Qt eats it as a shortcut marker.
+                        ui.Button({"ID": "BtnXPApply", "Text": "Review and Apply",
                                    "Weight": 0}),
                     ]),
                 ],
@@ -4709,11 +4897,28 @@ def xcheck_picker(project, conflicts, ctx):
                                   f"  ·  {len(choices)} decided")
         ditems["XPNote"].Text = (
             '<span style="color:#E8A06A;"><b>Graded differently WITHIN '
-            + _html_escape(", ".join(conflict["split"]))
+            + _html_escape(", ".join(_xcheck_elide(n) for n in conflict["split"]))
             + "</b><br>The source is used more than once there. Applying"
             " makes those uses match too -- skip the shot if that's"
             " deliberate.</span>"
             if conflict["split"] else "")
+
+        # NEWEST TIMELINE goes on one variant only, and only when there is
+        # a clear winner.
+        stamps = [_xcheck_newest(v, ctx) for v in variants]
+        known = [s for s in stamps if s is not None]
+        newest = (max(known) if known and stamps.count(max(known)) == 1
+                  and len(set(known)) > 1 else None)
+        shown = list(range(offset, min(offset + XCHECK_CARD_SLOTS,
+                                       len(variants))))
+        infos = {i: _xcheck_variant_html(variants[i], i == chosen,
+                                         stamps[i] is not None
+                                         and stamps[i] == newest,
+                                         ctx["use_groups"], ctx)
+                 for i in shown}
+        width = thumb_width(len(shown), max(n for _, n in infos.values()),
+                            bool(conflict["split"]))
+        any_same = any(v.get("preview_same") for v in variants)
         for slot in range(XCHECK_CARD_SLOTS):
             index = offset + slot
             try:
@@ -4723,9 +4928,15 @@ def xcheck_picker(project, conflicts, ctx):
             if index >= len(variants):
                 continue
             variant = variants[index]
-            ditems[f"XPThumb_{slot}"].Text = _xcheck_thumb_html(variant)
-            ditems[f"XPInfo_{slot}"].Text = _xcheck_variant_html(
-                variant, index == chosen, ctx["use_groups"], ctx)
+            ditems[f"XPThumb_{slot}"].Text = _xcheck_thumb_html(
+                variant, width, any_same and variant.get("preview")
+                and not variant.get("preview_same"))
+            ditems[f"XPInfo_{slot}"].Text = infos[index][0]
+            try:
+                ditems[f"XPInfo_{slot}"].ToolTip = "\n".join(
+                    _xcheck_use_label(u, ctx) for u in variant["uses"])
+            except Exception:
+                pass
             ditems[f"BtnXPUse_{slot}"].Text = (
                 f"✓ Using {variant['letter']}" if index == chosen
                 else f"Use {variant['letter']}")
@@ -4738,6 +4949,36 @@ def xcheck_picker(project, conflicts, ctx):
             last = min(offset + XCHECK_CARD_SLOTS, len(variants))
             ditems["BtnXPMore"].Text = (f"Variants {offset + 1}-{last}"
                                         f" of {len(variants)} >")
+        # Cards appear and disappear between shots; without a fresh layout
+        # a hidden card kept its column (or a returning one got none) until
+        # the window was next resized.
+        try:
+            dlg.RecalcLayout()
+        except Exception:
+            pass
+        state["rendered"] = state["size"]
+
+    def thumb_width(n_cards, info_lines, has_note):
+        """Preview width that fills a card and still leaves room for the
+        card's text and the rows of buttons below, for the current size."""
+        win_w, win_h = state["size"]
+        card_w = (win_w - 30 - 14 * (max(1, n_cards) - 1)) / max(1, n_cards)
+        aspect = next((v.get("preview_aspect") for v in visible_variants()
+                       if v.get("preview_aspect")), 16 / 9.0)
+        room_h = win_h - 270 - (40 if has_note else 0) - 19 * info_lines
+        width = min(card_w - 10, room_h * aspect)
+        return int(max(XCHECK_THUMB_MIN_W, width))
+
+    def on_resize(ev=None):
+        try:
+            size = ev["Size"]
+            state["size"] = (int(size[1]), int(size[2]))
+        except Exception:
+            return
+        last = state["rendered"] or (0, 0)
+        if (abs(state["size"][0] - last[0]) >= 16
+                or abs(state["size"][1] - last[1]) >= 16):
+            render()
 
     def visible_variants():
         variants = current()["variants"]
@@ -4762,7 +5003,7 @@ def xcheck_picker(project, conflicts, ctx):
             return
         status(f"Grabbing previews -- {len(pending)} to go. Resolve jumps"
                f" between timelines while this runs.")
-        _xcheck_grab_preview(project, pending[0], ctx)
+        _xcheck_grab_preview(project, current(), pending[0], ctx)
         render()
         if len(pending) > 1:
             kick()
@@ -4809,6 +5050,9 @@ def xcheck_picker(project, conflicts, ctx):
             if _xcheck_park(project, use, ctx):
                 status(f"Showing {variant['letter']} ({n + 1} of {len(uses)}):"
                        f" {_xcheck_use_label(use, ctx)}"
+                       + ("" if _xcheck_use_visible(use) else
+                          " -- DISABLED here, so the viewer shows what's"
+                          " underneath")
                        + (" -- click again for the next use"
                           if len(uses) > 1 else ""))
             else:
@@ -4854,6 +5098,7 @@ def xcheck_picker(project, conflicts, ctx):
             except Exception:
                 pass
     dlg.On.XPPump.TextChanged = guard(on_pump)
+    dlg.On.XCPickerDlg.Resize = guard(on_resize)
 
     for slot in range(XCHECK_CARD_SLOTS):
         getattr(dlg.On, f"BtnXPUse_{slot}").Clicked = guard(make_use(slot))
