@@ -40,18 +40,23 @@ UPDATE_PLUGIN_FILENAME = "infinite_forms_plugin.py"
 # anything either way.
 UPDATE_STARTUP_DIALOG = True
 
+import base64
 import importlib.machinery
 import importlib.util
 import os
 from difflib import SequenceMatcher
 import re
+import shutil
 import ssl
+import struct
 import sys
+import tempfile
 import time
 import traceback
 import unicodedata
 import urllib.error
 import urllib.request
+import zlib
 
 # ---------------------------------------------------------------------------
 # Connect to Resolve / Fusion.
@@ -372,6 +377,7 @@ def build_main_panel():
                             ui.Button({"ID": "BtnLowerThirds", "Text": "Auto Lower Thirds"}),
                             ui.Button({"ID": "BtnBinFinder", "Text": "Bin Finder"}),
                             ui.Button({"ID": "BtnClipCount", "Text": "Clip Count"}),
+                            ui.Button({"ID": "BtnColourCrossCheck", "Text": "Colour Cross Check"}),
                             ui.Button({"ID": "BtnApplyClientColor", "Text": "Colour Grading Prep"}),
                             ui.Button({"ID": "BtnPhotogFolders", "Text": "Create Photographer Folders"}),
                             ui.Button({"ID": "BtnMatchGrades", "Text": "Match Grades"}),
@@ -434,6 +440,7 @@ def build_main_panel():
     win.On.BtnAssemble.Clicked = guard(on_assemble)
     win.On.BtnApplyClientColor.Clicked = guard(on_apply_client_color)
     win.On.BtnMatchGrades.Clicked = guard(on_match_grades)
+    win.On.BtnColourCrossCheck.Clicked = guard(on_colour_cross_check)
     win.On.BtnPhotogFolders.Clicked = guard(on_create_photographer_folders)
     win.On.BtnRenameTracks.Clicked = guard(on_rename_tracks)
     win.On.BtnSortShootNotes.Clicked = guard(on_sort_shoot_notes)
@@ -3251,6 +3258,12 @@ def _grade_source_key(timeline_item):
         return None
     if not mpi:
         return None
+    return _source_key_for_mpi(mpi)
+
+
+def _source_key_for_mpi(mpi):
+    """The key half of _grade_source_key, for callers that already hold
+    the Media Pool item."""
     try:
         uid = mpi.GetUniqueId()
         if uid:
@@ -3717,6 +3730,1356 @@ def on_match_grades(ev):
 
     limes_dialog(main_name, total_lime, len(target_names),
                  total_failed, total_suspect)
+
+
+# ---------------------------------------------------------------------------
+# Colour Cross Check -- tick a set of timelines, find every shot (same
+# source clip, whatever its in/out points) that is graded differently
+# between them, pick the version you like, and copy it to every other use.
+#
+# "Graded differently" is decided per use, from three things that can all
+# be read WITHOUT switching timelines -- so the scan never moves anything:
+#   colour  the clip grade exported as a 17-point LUT. Catches every
+#           colour-domain change, down to a nudged wheel or a qualifier.
+#   tools   which tools each node uses. Catches the spatial work a LUT
+#           can't hold (windows, NR, blur...). Empty nodes are ignored,
+#           and window POSITIONS aren't compared -- a reframed shot often
+#           needs its windows moved.
+#   group   the clip's colour group, whose pre/post-clip grades are part of
+#           the look. Optional, for timelines meant to sit in different
+#           client groups.
+# Only previews, Show in Resolve and Apply move the playhead, and the
+# timeline, page and playhead you started on are put back at the end.
+# ---------------------------------------------------------------------------
+XCHECK_LUT_TOLERANCE = 0.0005     # per LUT value; half a 10-bit code value
+XCHECK_CARD_SLOTS = 4             # variants shown side by side
+XCHECK_USES_LISTED = 6            # per card, before "...and N more"
+XCHECK_PREVIEW_BOX = (232, 130)   # preview size inside a card
+XCHECK_SETTLE_SECONDS = 0.35      # let Resolve land on a frame before a grab
+XCHECK_VERSION_PREFIX = "Cross Check"
+# Source types that carry no grade worth comparing.
+XCHECK_NOT_GRADED_TYPES = ("title", "generator", "matte")
+# Source types that don't hide the shot underneath them, so a preview can
+# be taken through them: titles, adjustment clips, and stills -- on an
+# upper track a still is a graphic (the full-length logo bug, location
+# pills), and treating it as opaque left whole timelines unpreviewable.
+XCHECK_OVERLAY_TYPES = ("title", "adjustment", "still")
+# Remembered between runs: ticked timelines per project, and the options.
+XCHECK_STATE = {"ticked": {}, "groups": True, "previews": True,
+                "keep_versions": True}
+
+
+def _xcheck_clip_type(mpi):
+    try:
+        return (mpi.GetClipProperty("Type") or "").lower()
+    except Exception:
+        return ""
+
+
+def _xcheck_read_lut(path):
+    """The numbers in an exported .cube, in file order. The header (title,
+    size) is skipped -- only the table itself is the grade."""
+    values = []
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                line = line.strip()
+                if line and (line[0].isdigit() or line[0] in "-."):
+                    values.extend(float(v) for v in line.split())
+    except Exception:
+        return None
+    return values or None
+
+
+def _xcheck_node_tools(item):
+    """(node count, tool signature). The signature is the sorted set of
+    tools in each node; nodes with no tools in them don't change the
+    picture, so they're left out. None if the node graph can't be read."""
+    try:
+        graph = item.GetNodeGraph()
+        count = int(graph.GetNumNodes() or 0)
+    except Exception:
+        return 0, None
+    signature = []
+    for index in range(1, count + 1):
+        try:
+            tools = graph.GetToolsInNode(index) or []
+        except Exception:
+            tools = []
+        if isinstance(tools, dict):
+            tools = list(tools.values())
+        if tools:
+            signature.append(tuple(sorted(str(t) for t in tools)))
+    return count, tuple(sorted(signature))
+
+
+def _xcheck_fingerprint(item, lut_path):
+    """Everything the comparison looks at, for one timeline item."""
+    fp = {"lut": None, "nodes": 0, "tools": None, "group": ""}
+    try:
+        os.remove(lut_path)     # a failed export must not read a stale file
+    except OSError:
+        pass
+    try:
+        if item.ExportLUT(getattr(resolve, "EXPORT_LUT_17PTCUBE", 1), lut_path):
+            fp["lut"] = _xcheck_read_lut(lut_path)
+    except Exception:
+        pass
+    fp["nodes"], fp["tools"] = _xcheck_node_tools(item)
+    try:
+        group = item.GetColorGroup()
+        fp["group"] = group.GetName() if group else ""
+    except Exception:
+        pass
+    return fp
+
+
+def _xcheck_differences(a, b, use_groups):
+    """Why two fingerprints count as different grades -- [] means same."""
+    reasons = []
+    lut_a, lut_b = a["lut"], b["lut"]
+    if (lut_a is None) != (lut_b is None):
+        reasons.append("colour")
+    elif lut_a is not None and lut_a != lut_b:
+        if len(lut_a) != len(lut_b) or any(
+                abs(x - y) > XCHECK_LUT_TOLERANCE for x, y in zip(lut_a, lut_b)):
+            reasons.append("colour")
+    if a["tools"] != b["tools"]:
+        reasons.append("node tools")
+    if use_groups and a["group"] != b["group"]:
+        reasons.append("colour group")
+    return reasons
+
+
+def _xcheck_is_ungraded(fp):
+    return fp["tools"] == ()
+
+
+def _xcheck_tc_to_frames(tc, base, drop):
+    parts = re.split(r"[:;.,]", (tc or "").strip())
+    if len(parts) != 4:
+        return None
+    try:
+        h, m, s, f = (int(p) for p in parts)
+    except ValueError:
+        return None
+    frames = ((h * 60 + m) * 60 + s) * base + f
+    if drop:
+        minutes = h * 60 + m
+        frames -= (base // 15) * (minutes - minutes // 10)
+    return frames
+
+
+def _xcheck_frames_to_tc(frames, base, drop):
+    frames = max(0, int(frames))
+    if drop:
+        dropped = base // 15                  # 2 at 29.97, 4 at 59.94
+        per_ten = base * 600 - dropped * 9
+        per_min = base * 60 - dropped
+        tens, rem = divmod(frames, per_ten)
+        frames += dropped * 9 * tens
+        if rem > dropped:
+            frames += dropped * ((rem - dropped) // per_min)
+    sep = ";" if drop else ":"
+    return (f"{frames // (base * 3600):02d}:{frames // (base * 60) % 60:02d}:"
+            f"{frames // base % 60:02d}{sep}{frames % base:02d}")
+
+
+def _xcheck_tc_format(timeline):
+    """(frames per timecode second, drop-frame?) for a timeline."""
+    try:
+        rate = float(str(timeline.GetSetting("timelineFrameRate")).split()[0])
+    except Exception:
+        rate = 24.0
+    base = int(round(rate)) or 24
+    drop = False
+    if base % 30 == 0:
+        try:
+            drop = str(timeline.GetSetting("timelineDropFrameTimecode")) == "1"
+        except Exception:
+            pass
+        try:
+            drop = drop or ";" in (timeline.GetStartTimecode() or "")
+        except Exception:
+            pass
+    return base, drop
+
+
+def _xcheck_timeline_info(use, ctx):
+    """Per-timeline facts the picker needs, read once: timecode format and
+    the preview size that fits the timeline's aspect ratio."""
+    info = ctx["tl_info"].get(use["tl_name"])
+    if info:
+        return info
+    timeline = use["tl"]
+    base, drop = _xcheck_tc_format(timeline)
+    try:
+        width = float(timeline.GetSetting("timelineResolutionWidth"))
+        height = float(timeline.GetSetting("timelineResolutionHeight"))
+    except Exception:
+        width, height = 16.0, 9.0
+    if width <= 0 or height <= 0:
+        width, height = 16.0, 9.0
+    box_w, box_h = XCHECK_PREVIEW_BOX
+    scale = min(box_w / width, box_h / height)
+    info = {"base": base, "drop": drop,
+            "preview": (int(width * scale), int(height * scale))}
+    ctx["tl_info"][use["tl_name"]] = info
+    return info
+
+
+def _xcheck_use_label(use, ctx):
+    info = _xcheck_timeline_info(use, ctx)
+    where = f"{use['tl_name']} · V{use['track']}"
+    if use.get("start") is not None:
+        where += " · " + _xcheck_frames_to_tc(use["start"], info["base"],
+                                                   info["drop"])
+    return where
+
+
+def _xcheck_timelines(project):
+    """[(name, timeline)] in project order."""
+    out = []
+    for i in range(1, int(project.GetTimelineCount() or 0) + 1):
+        timeline = project.GetTimelineByIndex(i)
+        if timeline:
+            out.append((timeline.GetName(), timeline))
+    return out
+
+
+def xcheck_scan(timelines, use_groups, ctx):
+    """Index every video item of the given timelines by source clip, then
+    fingerprint every use of each shot that appears in more than one of
+    them and split the uses into grade variants. Read-only throughout.
+    Returns (conflicts, stats)."""
+    started = time.time()
+    uses_by_source, order, gradable, types = {}, [], {}, {}
+    n_items = 0
+    for tl_name, timeline in timelines:
+        layers = ctx["layers"].setdefault(tl_name, {})
+        try:
+            track_count = int(timeline.GetTrackCount("video") or 0)
+        except Exception:
+            track_count = 0
+        for track in range(1, track_count + 1):
+            try:
+                track_items = timeline.GetItemListInTrack("video", track) or []
+            except Exception:
+                continue
+            opaque = layers.setdefault(track, [])
+            for item in track_items:
+                n_items += 1
+                try:
+                    mpi = item.GetMediaPoolItem()
+                except Exception:
+                    mpi = None
+                if not mpi:
+                    continue        # effects-library titles and generators
+                key = _source_key_for_mpi(mpi)
+                if key is None:
+                    continue
+                if key not in types:
+                    types[key] = _xcheck_clip_type(mpi)
+                    gradable[key] = not any(word in types[key]
+                                            for word in XCHECK_NOT_GRADED_TYPES)
+                if not any(word in types[key] for word in XCHECK_OVERLAY_TYPES):
+                    opaque.append(item)
+                if not gradable[key]:
+                    continue
+                if key not in uses_by_source:
+                    uses_by_source[key] = []
+                    order.append(key)
+                uses_by_source[key].append({"tl_name": tl_name, "tl": timeline,
+                                            "track": track, "item": item})
+        print(f"[Colour Cross Check] indexed '{tl_name}'")
+
+    shared = [key for key in order
+              if len({u["tl_name"] for u in uses_by_source[key]}) > 1]
+    n_uses = sum(len(uses_by_source[key]) for key in shared)
+    log(f"  {n_items} clip(s) indexed in {time.time() - started:.0f}s;"
+        f" {len(shared)} shot(s) appear in more than one timeline --"
+        f" comparing {n_uses} use(s)...")
+
+    conflicts, unreadable, done = [], 0, 0
+    for key in shared:
+        variants = []
+        for use in uses_by_source[key]:
+            fp = _xcheck_fingerprint(use["item"], ctx["lut_path"])
+            use["group"] = fp["group"]
+            if fp["lut"] is None:
+                unreadable += 1
+            for variant in variants:
+                if not _xcheck_differences(variant["fp"], fp, use_groups):
+                    variant["uses"].append(use)
+                    break
+            else:
+                variants.append({"fp": fp, "uses": [use]})
+            done += 1
+            if done % 50 == 0:
+                print(f"[Colour Cross Check] compared {done} / {n_uses}")
+        if len(variants) > 1:
+            conflicts.append(_xcheck_build_conflict(variants, use_groups))
+
+    stats = {"items": n_items, "shared": len(shared), "uses": n_uses,
+             "unreadable": unreadable, "seconds": time.time() - started}
+    return conflicts, stats
+
+
+def _xcheck_build_conflict(variants, use_groups):
+    """Order a shot's variants (graded before ungraded, most-used first),
+    letter them, note why each differs from A, and read the positions the
+    picker shows -- only for shots that actually conflict."""
+    variants.sort(key=lambda v: (_xcheck_is_ungraded(v["fp"]), -len(v["uses"])))
+    for index, variant in enumerate(variants):
+        variant["letter"] = chr(65 + index) if index < 26 else f"#{index + 1}"
+        variant["preview"] = None
+        variant["show_next"] = 0
+        variant["reasons"] = (_xcheck_differences(variants[0]["fp"], variant["fp"],
+                                                  use_groups) if index else [])
+        for use in variant["uses"]:
+            for field, getter in (("start", "GetStart"), ("end", "GetEnd")):
+                try:
+                    use[field] = int(getattr(use["item"], getter)())
+                except Exception:
+                    use[field] = None
+    seen, split = {}, []
+    for index, variant in enumerate(variants):
+        for use in variant["uses"]:
+            first = seen.setdefault(use["tl_name"], index)
+            if first != index and use["tl_name"] not in split:
+                split.append(use["tl_name"])
+    try:
+        name = variants[0]["uses"][0]["item"].GetName()
+    except Exception:
+        name = "(unnamed clip)"
+    return {"name": name, "variants": variants, "split": split}
+
+
+# --- Moving Resolve to a shot (previews, Show in Resolve) ------------------
+def _xcheck_clear_frame(use, ctx):
+    """(frame, covered): a frame inside this use where nothing opaque sits
+    on a higher track, so a preview shows THIS shot. covered=True means
+    every frame tried is hidden and the middle frame is returned anyway."""
+    start, end = use.get("start"), use.get("end")
+    if start is None or end is None or end <= start:
+        return None, True
+    timeline = use["tl"]
+    spans = []
+    for track, opaque in ctx["layers"].get(use["tl_name"], {}).items():
+        if track <= use["track"]:
+            continue
+        cache_key = (use["tl_name"], track)
+        if cache_key not in ctx["spans"]:
+            track_spans = []
+            try:
+                enabled = timeline.GetIsTrackEnabled("video", track)
+            except Exception:
+                enabled = True
+            if enabled:
+                for item in opaque:
+                    try:
+                        track_spans.append((int(item.GetStart()), int(item.GetEnd())))
+                    except Exception:
+                        pass
+            ctx["spans"][cache_key] = track_spans
+        spans.extend(ctx["spans"][cache_key])
+    length = end - start
+    for fraction in (0.5, 0.3, 0.7, 0.15, 0.85):
+        frame = start + int(length * fraction)
+        if not any(s <= frame < e for s, e in spans):
+            return frame, False
+    return start + length // 2, True
+
+
+def _xcheck_park(project, use, ctx, frame=None):
+    """Bring Resolve to one use of a shot: Color page, its timeline, the
+    playhead on it. Returns True if the playhead was placed."""
+    if frame is None:
+        frame, _covered = _xcheck_clear_frame(use, ctx)
+        if frame is None:
+            return False
+    ctx["moved"] = True
+    try:
+        if (resolve.GetCurrentPage() or "") != "color":
+            resolve.OpenPage("color")
+    except Exception:
+        pass
+    timeline = use["tl"]
+    try:
+        project.SetCurrentTimeline(timeline)
+    except Exception:
+        return False
+    info = _xcheck_timeline_info(use, ctx)
+    try:
+        return bool(timeline.SetCurrentTimecode(
+            _xcheck_frames_to_tc(frame, info["base"], info["drop"])))
+    except Exception:
+        return False
+
+
+def _xcheck_write_png(path, width, height, rgb):
+    """Minimal 8-bit RGB PNG writer -- no imaging library in Resolve's
+    Python to lean on."""
+    stride = width * 3
+    raw = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride]
+                   for y in range(height))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    with open(path, "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n"
+                     + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                                  8, 2, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw))
+                     + chunk(b"IEND", b""))
+
+
+def _xcheck_thumbnail_png(use, path):
+    """Fallback preview: the Color page's thumbnail of its current clip.
+    Only trusted when that current clip IS this use -- otherwise it would
+    be a picture of something else."""
+    timeline = use["tl"]
+    try:
+        current = timeline.GetCurrentVideoItem()
+        if not current or current.GetUniqueId() != use["item"].GetUniqueId():
+            return False
+        thumb = timeline.GetCurrentClipThumbnailImage() or {}
+        width, height = int(thumb["width"]), int(thumb["height"])
+        rgb = base64.b64decode(thumb["data"])
+    except Exception:
+        return False
+    if width <= 0 or height <= 0 or len(rgb) < width * height * 3:
+        return False
+    try:
+        _xcheck_write_png(path, width, height, rgb)
+    except Exception:
+        return False
+    return True
+
+
+def _xcheck_grab_preview(project, variant, ctx):
+    """Export the current frame of one use of this variant as its preview.
+    Tries up to three uses, skipping any hidden under a clip above. A
+    variant that can't be previewed is marked "" so it isn't retried."""
+    if variant.get("preview") is not None:
+        return
+    variant["preview"] = ""
+    for use in variant["uses"][:3]:
+        frame, covered = _xcheck_clear_frame(use, ctx)
+        if frame is None or covered:
+            continue
+        if not _xcheck_park(project, use, ctx, frame):
+            continue
+        time.sleep(XCHECK_SETTLE_SECONDS)
+        ctx["seq"] += 1
+        # Unique names: Qt caches images by path, and a reused path would
+        # show the previous shot.
+        stem = os.path.join(ctx["tmp"], f"preview_{ctx['seq']}")
+        for ext in (".jpg", ".png"):
+            try:
+                ok = project.ExportCurrentFrameAsStill(stem + ext)
+            except Exception:
+                ok = False
+            if ok and os.path.isfile(stem + ext):
+                variant["preview"] = stem + ext
+                break
+        else:
+            if _xcheck_thumbnail_png(use, stem + "_thumb.png"):
+                variant["preview"] = stem + "_thumb.png"
+        if variant["preview"]:
+            variant["preview_size"] = _xcheck_timeline_info(use, ctx)["preview"]
+            return
+
+
+def _xcheck_snapshot(project):
+    snap = {"timeline": None, "tc": "", "page": ""}
+    try:
+        snap["page"] = resolve.GetCurrentPage() or ""
+    except Exception:
+        pass
+    try:
+        snap["timeline"] = project.GetCurrentTimeline()
+        if snap["timeline"]:
+            snap["tc"] = snap["timeline"].GetCurrentTimecode() or ""
+    except Exception:
+        pass
+    return snap
+
+
+def _xcheck_restore(project, snap):
+    """Back to the timeline, playhead and page the run started from."""
+    if snap["timeline"]:
+        try:
+            project.SetCurrentTimeline(snap["timeline"])
+            if snap["tc"]:
+                snap["timeline"].SetCurrentTimecode(snap["tc"])
+        except Exception:
+            pass
+    if snap["page"]:
+        try:
+            resolve.OpenPage(snap["page"])
+        except Exception:
+            pass
+
+
+# --- Dialogs ----------------------------------------------------------------
+def xcheck_select_dialog(names, ticked, use_groups):
+    """Tick the timelines to compare. Click a row to tick/untick it; the
+    filter narrows the list and 'Tick all shown' ticks what's left (type
+    "V3", tick all shown, done). Returns (ticked names in project order,
+    use_groups) or None."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    ticked = set(name for name in ticked if name in names)
+    result = {"value": None}
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "XCSelectDlg",
+            "WindowTitle": "Colour Cross Check",
+            "Geometry": [200, 120, 560, 640],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.Label({"Text": "Tick the timelines to compare. Every"
+                                      " shot used in more than one of them is"
+                                      " checked for a different grade --"
+                                      " in/out points don't matter.",
+                              "WordWrap": True, "Weight": 0}),
+                    ui.HGroup({"Spacing": 6, "Weight": 0}, [
+                        ui.LineEdit({"ID": "XCFilter", "Weight": 1,
+                                     "PlaceholderText": "Filter, e.g. V3 HCOM"}),
+                        ui.Button({"ID": "BtnXCTickShown",
+                                   "Text": "Tick all shown", "Weight": 0}),
+                        ui.Button({"ID": "BtnXCClear", "Text": "Clear",
+                                   "Weight": 0}),
+                    ]),
+                    ui.Tree({"ID": "XCTree", "Weight": 1,
+                             "SortingEnabled": False,
+                             "AlternatingRowColors": True,
+                             "Events": {"ItemClicked": True}}),
+                    ui.Label({"ID": "XCCount", "Text": "", "WordWrap": True,
+                              "Weight": 0}),
+                    ui.CheckBox({"ID": "XCGroups",
+                                 "Text": "A different colour group counts as"
+                                         " a different grade",
+                                 "Checked": use_groups, "Weight": 0}),
+                    ui.Label({"Text": '<span style="color:#8A9384;">Untick'
+                                      ' when the timelines are meant to sit in'
+                                      ' different client groups (Expedia vs'
+                                      ' Skyscanner): only clip grades are then'
+                                      ' compared and copied, and groups are'
+                                      ' left alone.</span>',
+                              "WordWrap": True, "Weight": 0}),
+                    ui.Label({"ID": "XCWarn", "Text": "", "Weight": 0}),
+                    ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                        ui.Button({"ID": "BtnXCCancel", "Text": "Cancel"}),
+                        ui.Button({"ID": "BtnXCRun", "Text": "Run Cross Check"}),
+                    ]),
+                ],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+    tree = ditems["XCTree"]
+    try:
+        tree.ColumnCount = 2
+        header = tree.NewItem()
+        header.Text[0] = "✓"
+        header.Text[1] = "Timeline"
+        tree.SetHeaderItem(header)
+        tree.ColumnWidth[0] = 34
+    except Exception:
+        pass
+
+    def shown():
+        tokens = (ditems["XCFilter"].Text or "").lower().split()
+        return [n for n in names if all(t in n.lower() for t in tokens)]
+
+    def update_count():
+        picked = [n for n in names if n in ticked]
+        text = f"{len(picked)} timeline(s) ticked"
+        if 0 < len(picked) <= 4:
+            text += ": " + ", ".join(picked)
+        ditems["XCCount"].Text = text
+
+    def refresh(_ev=None):
+        try:
+            tree.Clear()
+        except Exception:
+            pass
+        for name in shown():
+            row = tree.NewItem()
+            row.Text[0] = "✓" if name in ticked else ""
+            row.Text[1] = name
+            tree.AddTopLevelItem(row)
+        update_count()
+
+    def on_click(ev=None):
+        row = None
+        try:
+            row = ev["item"]
+        except Exception:
+            pass
+        if row is None:
+            try:
+                row = tree.CurrentItem()
+            except Exception:
+                row = None
+        if row is None:
+            return
+        name = row.Text[1]
+        if not name:
+            return
+        if name in ticked:
+            ticked.discard(name)
+            row.Text[0] = ""
+        else:
+            ticked.add(name)
+            row.Text[0] = "✓"
+        ditems["XCWarn"].Text = ""
+        update_count()
+
+    def on_tick_shown(_ev=None):
+        ticked.update(shown())
+        refresh()
+
+    def on_clear(_ev=None):
+        ticked.clear()
+        refresh()
+
+    def on_run(_ev=None):
+        picked = [n for n in names if n in ticked]
+        if len(picked) < 2:
+            ditems["XCWarn"].Text = "Tick at least two timelines."
+            return
+        result["value"] = (picked, bool(ditems["XCGroups"].Checked))
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev=None):
+        dlg_disp.ExitLoop()
+
+    def _noop(_ev=None):
+        pass
+    for widget, events in (("XCTree", ("ItemChanged", "ItemSelectionChanged",
+                                       "CurrentItemChanged")),
+                           ("XCFilter", ("TextEdited", "EditingFinished",
+                                         "ReturnPressed")),
+                           ("XCGroups", ("Toggled",))):
+        for event_name in events:
+            try:
+                setattr(getattr(dlg.On, widget), event_name, _noop)
+            except Exception:
+                pass
+
+    dlg.On.XCTree.ItemClicked = guard(on_click)
+    dlg.On.XCFilter.TextChanged = guard(refresh)
+    dlg.On.BtnXCTickShown.Clicked = guard(on_tick_shown)
+    dlg.On.BtnXCClear.Clicked = guard(on_clear)
+    dlg.On.BtnXCRun.Clicked = guard(on_run)
+    dlg.On.BtnXCCancel.Clicked = on_cancel
+    dlg.On.XCSelectDlg.Close = on_cancel
+    refresh()
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "cross check timeline picker")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["value"]
+
+
+def _xcheck_tool_summary(signature):
+    seen = []
+    for node in signature or ():
+        for tool in node:
+            if "Mixer" not in tool and tool not in seen:
+                seen.append(tool)
+    if len(seen) > 6:
+        return ", ".join(seen[:6]) + f" +{len(seen) - 6} more"
+    return ", ".join(seen)
+
+
+def _xcheck_variant_html(variant, chosen, use_groups, ctx):
+    fp = variant["fp"]
+    head = (f'<span style="font-size:18px; color:#C4A253;">'
+            f'<b>{variant["letter"]}</b></span>')
+    if chosen:
+        head += ' &nbsp;<span style="color:#B7E36B;"><b>✓ CHOSEN</b></span>'
+    if _xcheck_is_ungraded(fp):
+        look = ('<span style="color:#E8A06A;"><b>UNGRADED</b></span>'
+                ' -- empty node tree')
+    else:
+        look = f"{fp['nodes']} node(s)"
+    if fp["lut"] is None:
+        look += ' <span style="color:#E8A06A;">(colour unreadable)</span>'
+    lines = [head, look]
+    if use_groups:
+        lines.append("Group: " + _html_escape(fp["group"] or "none"))
+    else:
+        groups = sorted({u.get("group") or "none" for u in variant["uses"]})
+        lines.append("Group: " + _html_escape(", ".join(groups)))
+    tools = _xcheck_tool_summary(fp["tools"])
+    if tools:
+        lines.append(f'<span style="color:#8A9384;">{_html_escape(tools)}</span>')
+    if variant["reasons"]:
+        lines.append('<span style="color:#E8A06A;">Differs from A: '
+                     + ", ".join(variant["reasons"]) + "</span>")
+    lines.append(f"<b>Used {len(variant['uses'])}x:</b>")
+    for use in variant["uses"][:XCHECK_USES_LISTED]:
+        lines.append(_html_escape(_xcheck_use_label(use, ctx)))
+    extra = len(variant["uses"]) - XCHECK_USES_LISTED
+    if extra > 0:
+        lines.append(f"...and {extra} more")
+    return "<br>".join(lines)
+
+
+def _xcheck_thumb_html(variant):
+    path = variant.get("preview")
+    if path:
+        width, height = variant.get("preview_size") or XCHECK_PREVIEW_BOX
+        return f'<img src="{path}" width="{width}" height="{height}">'
+    if path == "":
+        return ('<span style="color:#8A9384;">No preview -- hidden under a'
+                ' clip above, or the grab failed.<br>Use Show in'
+                ' Resolve.</span>')
+    return '<span style="color:#8A9384;">No preview yet</span>'
+
+
+def xcheck_picker(project, conflicts, ctx):
+    """Step through the conflicts one shot at a time: a card per variant
+    with a preview, where it's used, Show in Resolve (cycles through its
+    uses in Resolve's own viewer) and Use. Choosing advances to the next
+    shot. Returns True to go to the review screen, False if cancelled.
+    Choices, position and previews live on ctx and the conflicts, so
+    coming back from the review screen picks up exactly where it was."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    choices = ctx["choices"]
+    state = {"offset": 0, "apply": False}
+    box_w, box_h = XCHECK_PREVIEW_BOX
+
+    cards = []
+    for slot in range(XCHECK_CARD_SLOTS):
+        cards.append(ui.VGroup({"ID": f"XPCard_{slot}", "Spacing": 4}, [
+            ui.Label({"ID": f"XPThumb_{slot}", "Text": "", "Weight": 0,
+                      "MinimumSize": [box_w, box_h + 6],
+                      "Alignment": {"AlignHCenter": True,
+                                    "AlignVCenter": True}}),
+            ui.Label({"ID": f"XPInfo_{slot}", "Text": "", "WordWrap": True,
+                      "Weight": 1,
+                      "Alignment": {"AlignLeft": True, "AlignTop": True}}),
+            ui.HGroup({"Spacing": 4, "Weight": 0}, [
+                ui.Button({"ID": f"BtnXPShow_{slot}", "Text": "Show in Resolve"}),
+                ui.Button({"ID": f"BtnXPUse_{slot}", "Text": "Use"}),
+            ]),
+        ]))
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "XCPickerDlg",
+            "WindowTitle": "Colour Cross Check",
+            "Geometry": [120, 90, 1080, 640],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.HGroup({"Spacing": 6, "Weight": 0}, [
+                        ui.Label({"ID": "XPHeader", "Text": "", "Weight": 1}),
+                        ui.Label({"ID": "XPTally", "Text": "", "Weight": 0}),
+                    ]),
+                    ui.Label({"ID": "XPNote", "Text": "", "WordWrap": True,
+                              "Weight": 0}),
+                    ui.HGroup({"Spacing": 14, "Weight": 1}, cards),
+                    ui.HGroup({"Spacing": 6, "Weight": 0}, [
+                        ui.Button({"ID": "BtnXPMore", "Text": "More variants",
+                                   "Weight": 0}),
+                        ui.Label({"ID": "XPStatus", "Text": "",
+                                  "WordWrap": True, "Weight": 1}),
+                        ui.CheckBox({"ID": "XPAuto", "Text": "Auto previews",
+                                     "Checked": XCHECK_STATE["previews"],
+                                     "Weight": 0}),
+                        ui.Button({"ID": "BtnXPGrab", "Text": "Grab previews",
+                                   "Weight": 0}),
+                    ]),
+                    ui.HGroup({"Spacing": 6, "Weight": 0}, [
+                        ui.Button({"ID": "BtnXPPrev", "Text": "< Previous shot",
+                                   "Weight": 0}),
+                        ui.Button({"ID": "BtnXPSkip", "Text": "Skip shot",
+                                   "Weight": 0}),
+                        ui.Button({"ID": "BtnXPNext", "Text": "Next shot >",
+                                   "Weight": 0}),
+                        ui.Label({"Text": "", "Weight": 1}),
+                        ui.Button({"ID": "BtnXPCancel", "Text": "Cancel",
+                                   "Weight": 0}),
+                        ui.Button({"ID": "BtnXPApply", "Text": "Review & Apply",
+                                   "Weight": 0}),
+                    ]),
+                ],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+
+    def status(text):
+        ditems["XPStatus"].Text = text
+
+    def current():
+        return conflicts[ctx["index"]]
+
+    def render():
+        conflict = current()
+        variants = conflict["variants"]
+        chosen = choices.get(ctx["index"])
+        offset = state["offset"]
+        n_timelines = len({u["tl_name"] for v in variants for u in v["uses"]})
+        n_uses = sum(len(v["uses"]) for v in variants)
+        ditems["XPHeader"].Text = (
+            f'<span style="font-size:15px;"><b>{_html_escape(conflict["name"])}'
+            f'</b></span> &nbsp;<span style="color:#8A9384;">graded'
+            f' {len(variants)} ways across {n_timelines} timeline(s),'
+            f' {n_uses} use(s)</span>')
+        ditems["XPTally"].Text = (f"Shot {ctx['index'] + 1} of {len(conflicts)}"
+                                  f"  ·  {len(choices)} decided")
+        ditems["XPNote"].Text = (
+            '<span style="color:#E8A06A;">Graded differently WITHIN '
+            + _html_escape(", ".join(conflict["split"]))
+            + " -- the source is used more than once there. Applying makes"
+            " those uses match too; skip the shot if that's deliberate.</span>"
+            if conflict["split"] else "")
+        for slot in range(XCHECK_CARD_SLOTS):
+            index = offset + slot
+            try:
+                ditems[f"XPCard_{slot}"].Hidden = index >= len(variants)
+            except Exception:
+                pass
+            if index >= len(variants):
+                continue
+            variant = variants[index]
+            ditems[f"XPThumb_{slot}"].Text = _xcheck_thumb_html(variant)
+            ditems[f"XPInfo_{slot}"].Text = _xcheck_variant_html(
+                variant, index == chosen, ctx["use_groups"], ctx)
+            ditems[f"BtnXPUse_{slot}"].Text = (
+                f"✓ Using {variant['letter']}" if index == chosen
+                else f"Use {variant['letter']}")
+        more = len(variants) > XCHECK_CARD_SLOTS
+        try:
+            ditems["BtnXPMore"].Hidden = not more
+        except Exception:
+            pass
+        if more:
+            last = min(offset + XCHECK_CARD_SLOTS, len(variants))
+            ditems["BtnXPMore"].Text = (f"Variants {offset + 1}-{last}"
+                                        f" of {len(variants)} >")
+
+    def grab(_ev=None):
+        variants = current()["variants"]
+        visible = variants[state["offset"]:state["offset"] + XCHECK_CARD_SLOTS]
+        pending = [v for v in visible if v.get("preview") is None]
+        if not pending:
+            return
+        print(f"[Colour Cross Check] grabbing {len(pending)} preview(s)...")
+        for variant in pending:
+            _xcheck_grab_preview(project, variant, ctx)
+        render()
+        missing = sum(1 for v in visible if not v.get("preview"))
+        status(f"{missing} variant(s) without a preview -- Show in Resolve"
+               f" works for every variant." if missing else "")
+
+    def go(index):
+        ctx["index"] = max(0, min(index, len(conflicts) - 1))
+        state["offset"] = 0
+        status("")
+        render()
+        if ditems["XPAuto"].Checked:
+            grab()
+
+    def make_use(slot):
+        def on_use(_ev=None):
+            index = state["offset"] + slot
+            variants = current()["variants"]
+            if index >= len(variants):
+                return
+            choices[ctx["index"]] = index
+            if ctx["index"] < len(conflicts) - 1:
+                go(ctx["index"] + 1)
+                status(f"Previous shot: using {variants[index]['letter']}.")
+            else:
+                render()
+                status("That was the last shot -- Review & Apply when ready.")
+        on_use.__name__ = f"xcheck_use_{slot}"
+        return on_use
+
+    def make_show(slot):
+        def on_show(_ev=None):
+            index = state["offset"] + slot
+            variants = current()["variants"]
+            if index >= len(variants):
+                return
+            variant = variants[index]
+            uses = variant["uses"]
+            n = variant["show_next"] % len(uses)
+            variant["show_next"] += 1
+            use = uses[n]
+            if _xcheck_park(project, use, ctx):
+                status(f"Showing {variant['letter']} ({n + 1} of {len(uses)}):"
+                       f" {_xcheck_use_label(use, ctx)}"
+                       + (" -- click again for the next use"
+                          if len(uses) > 1 else ""))
+            else:
+                status("Couldn't move Resolve to that clip.")
+        on_show.__name__ = f"xcheck_show_{slot}"
+        return on_show
+
+    def on_more(_ev=None):
+        variants = current()["variants"]
+        state["offset"] += XCHECK_CARD_SLOTS
+        if state["offset"] >= len(variants):
+            state["offset"] = 0
+        render()
+        if ditems["XPAuto"].Checked:
+            grab()
+
+    def on_skip(_ev=None):
+        choices.pop(ctx["index"], None)
+        if ctx["index"] < len(conflicts) - 1:
+            go(ctx["index"] + 1)
+        else:
+            render()
+
+    def on_apply(_ev=None):
+        if not choices:
+            status("Nothing chosen yet -- pick a variant with Use first.")
+            return
+        state["apply"] = True
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev=None):
+        dlg_disp.ExitLoop()
+
+    def _noop(_ev=None):
+        pass
+    try:
+        dlg.On.XPAuto.Toggled = _noop
+    except Exception:
+        pass
+
+    for slot in range(XCHECK_CARD_SLOTS):
+        getattr(dlg.On, f"BtnXPUse_{slot}").Clicked = guard(make_use(slot))
+        getattr(dlg.On, f"BtnXPShow_{slot}").Clicked = guard(make_show(slot))
+    dlg.On.BtnXPMore.Clicked = guard(on_more)
+    dlg.On.BtnXPGrab.Clicked = guard(grab)
+    dlg.On.BtnXPPrev.Clicked = guard(lambda _ev=None: go(ctx["index"] - 1))
+    dlg.On.BtnXPNext.Clicked = guard(lambda _ev=None: go(ctx["index"] + 1))
+    dlg.On.BtnXPSkip.Clicked = guard(on_skip)
+    dlg.On.BtnXPApply.Clicked = guard(on_apply)
+    dlg.On.BtnXPCancel.Clicked = on_cancel
+    dlg.On.XCPickerDlg.Close = on_cancel
+
+    hold_log_widget()
+    try:
+        # First shot's previews before the window shows, so it opens
+        # complete rather than blank-then-filled.
+        render()
+        if XCHECK_STATE["previews"]:
+            grab()
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "cross check picker")
+        XCHECK_STATE["previews"] = bool(ditems["XPAuto"].Checked)
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return state["apply"]
+
+
+def _xcheck_targets(conflict, chosen_index):
+    """Every use that isn't already in the chosen variant."""
+    return [use for index, variant in enumerate(conflict["variants"])
+            if index != chosen_index for use in variant["uses"]]
+
+
+def xcheck_review_dialog(conflicts, choices):
+    """Last look before anything changes. Returns ("apply", keep_versions),
+    ("back",) or ("cancel",)."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    result = {"action": ("cancel",)}
+    lines, all_timelines, n_clips = [], set(), 0
+    for ci in sorted(choices):
+        conflict = conflicts[ci]
+        chosen = conflict["variants"][choices[ci]]
+        targets = _xcheck_targets(conflict, choices[ci])
+        timelines = sorted({u["tl_name"] for u in targets})
+        all_timelines.update(timelines)
+        n_clips += len(targets)
+        lines.append(f"{conflict['name']}: use {chosen['letter']}"
+                     f" -> {len(targets)} clip(s) in {', '.join(timelines)}")
+    skipped = len(conflicts) - len(choices)
+    if skipped:
+        lines += ["", f"{skipped} shot(s) skipped -- left exactly as they are."]
+    body_html = ("<pre style=\"font-family: Menlo, Consolas, monospace;"
+                 " font-size: 12px; margin: 0;\">"
+                 + _html_escape("\n".join(lines)) + "</pre>")
+
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "XCReviewDlg",
+            "WindowTitle": "Colour Cross Check -- Review",
+            "Geometry": [220, 140, 640, 560],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 8},
+                [
+                    ui.Label({"Text": f"<b>{len(choices)} shot(s) chosen.</b>"
+                                      f" {n_clips} clip(s) across"
+                                      f" {len(all_timelines)} timeline(s) will"
+                                      f" take the chosen grade.",
+                              "WordWrap": True, "Weight": 0}),
+                    ui.TextEdit({"ID": "XCReviewText", "ReadOnly": True,
+                                 "Weight": 1}),
+                    ui.CheckBox({"ID": "XCKeepVersions",
+                                 "Text": "Keep each clip's old grade as a"
+                                         " local version",
+                                 "Checked": XCHECK_STATE["keep_versions"],
+                                 "Weight": 0}),
+                    ui.Label({"Text": '<span style="color:#8A9384;">The new'
+                                      ' grade goes into a new local version'
+                                      f' named "{XCHECK_VERSION_PREFIX} ..."; the'
+                                      ' old one stays on the clip (Color page'
+                                      ' > right-click the clip > Local'
+                                      ' Versions to switch back). A clip whose'
+                                      ' version can\'t be made is left'
+                                      ' untouched.</span>',
+                              "WordWrap": True, "Weight": 0}),
+                    ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                        ui.Button({"ID": "BtnXCBack", "Text": "< Back to shots"}),
+                        ui.Button({"ID": "BtnXCRevCancel", "Text": "Cancel"}),
+                        ui.Button({"ID": "BtnXCApply", "Text": "Apply"}),
+                    ]),
+                ],
+            )
+        ],
+    )
+    ditems = dlg.GetItems()
+    try:
+        ditems["XCReviewText"].HTML = body_html
+    except Exception:
+        ditems["XCReviewText"].Text = "\n".join(lines)
+
+    def on_apply(_ev=None):
+        keep = bool(ditems["XCKeepVersions"].Checked)
+        XCHECK_STATE["keep_versions"] = keep
+        result["action"] = ("apply", keep)
+        dlg_disp.ExitLoop()
+
+    def on_back(_ev=None):
+        result["action"] = ("back",)
+        dlg_disp.ExitLoop()
+
+    def on_cancel(_ev=None):
+        dlg_disp.ExitLoop()
+
+    def _noop(_ev=None):
+        pass
+    for widget, event_name in (("XCKeepVersions", "Toggled"),
+                               ("XCReviewText", "TextChanged")):
+        try:
+            setattr(getattr(dlg.On, widget), event_name, _noop)
+        except Exception:
+            pass
+    dlg.On.BtnXCApply.Clicked = on_apply
+    dlg.On.BtnXCBack.Clicked = on_back
+    dlg.On.BtnXCRevCancel.Clicked = on_cancel
+    dlg.On.XCReviewDlg.Close = on_cancel
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "cross check review")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["action"]
+
+
+# --- Apply ------------------------------------------------------------------
+def _xcheck_new_version(use, base_name):
+    """Give the target a fresh local version and make it current, so the
+    copy lands there and the old grade survives in the version it was in.
+    Records how to undo it on the use. False = no safe version, so the
+    clip must not be touched."""
+    item = use["item"]
+    try:
+        current = item.GetCurrentVersion() or {}
+        previous = current.get("versionName")
+        vtype = int(current.get("versionType") or 0)
+        existing = item.GetVersionNameList(vtype) or []
+        if isinstance(existing, dict):
+            existing = list(existing.values())
+    except Exception:
+        return False
+    if not previous:
+        return False
+    name, n = base_name, 2
+    while name in existing:
+        name, n = f"{base_name} ({n})", n + 1
+    try:
+        if not item.AddVersion(name, vtype):
+            return False
+        if not item.LoadVersionByName(name, vtype):
+            item.DeleteVersionByName(name, vtype)
+            return False
+    except Exception:
+        return False
+    use["backup"] = (previous, name, vtype)
+    return True
+
+
+def _xcheck_undo_version(use):
+    previous, name, vtype = use.pop("backup", (None, None, 0))
+    if not previous:
+        return
+    try:
+        use["item"].LoadVersionByName(previous, vtype)
+        use["item"].DeleteVersionByName(name, vtype)
+    except Exception:
+        pass
+
+
+def _xcheck_copy(src_item, uses):
+    """CopyGrades in one batch; if the batch fails, clip by clip so one bad
+    clip can't sink the rest (same as Match Grades). Returns the uses
+    that took the grade."""
+    if not uses:
+        return []
+    try:
+        if src_item.CopyGrades([u["item"] for u in uses]):
+            return list(uses)
+    except Exception:
+        pass
+    copied = []
+    for use in uses:
+        try:
+            if src_item.CopyGrades([use["item"]]):
+                copied.append(use)
+        except Exception:
+            pass
+    return copied
+
+
+def _xcheck_match_group(item, group):
+    """Put the target in the chosen clip's colour group (or out of any
+    group, if the chosen clip has none)."""
+    try:
+        current = item.GetColorGroup()
+        if group is None:
+            return current is None or bool(item.RemoveFromColorGroup())
+        if current is not None and current.GetName() == group.GetName():
+            return True
+        return bool(item.AssignToColorGroup(group))
+    except Exception:
+        return False
+
+
+def xcheck_apply(project, conflicts, choices, ctx, keep_versions):
+    """Copy each chosen grade onto every other use of its shot. Every
+    target is re-read afterwards and compared with the chosen clip, so the
+    report says what actually landed, not what was attempted."""
+    use_groups = ctx["use_groups"]
+    version_name = f"{XCHECK_VERSION_PREFIX} {time.strftime('%Y-%m-%d %H:%M')}"
+    totals = {"matched": 0, "differs": 0, "failed": 0, "untouched": 0}
+    body = []
+    for ci in sorted(choices):
+        conflict = conflicts[ci]
+        chosen = conflict["variants"][choices[ci]]
+        src_item = chosen["uses"][0]["item"]
+        # Compare against the chosen clip as it is NOW -- it may have been
+        # touched in Resolve since the scan.
+        src_fp = _xcheck_fingerprint(src_item, ctx["lut_path"])
+        src_group = None
+        if use_groups:
+            try:
+                src_group = src_item.GetColorGroup()
+            except Exception:
+                src_group = None
+        by_timeline = {}
+        for use in _xcheck_targets(conflict, choices[ci]):
+            by_timeline.setdefault(use["tl_name"], []).append(use)
+
+        matched, problems = 0, []
+        for tl_name, uses in by_timeline.items():
+            try:
+                project.SetCurrentTimeline(uses[0]["tl"])
+                ctx["moved"] = True
+            except Exception:
+                pass
+            ready = []
+            for use in uses:
+                if keep_versions and not _xcheck_new_version(use, version_name):
+                    totals["untouched"] += 1
+                    problems.append("no backup version, left untouched: "
+                                    + _xcheck_use_label(use, ctx))
+                    continue
+                ready.append(use)
+            copied = {id(use) for use in _xcheck_copy(src_item, ready)}
+            for use in ready:
+                if id(use) not in copied:
+                    _xcheck_undo_version(use)
+                    totals["failed"] += 1
+                    problems.append("copy FAILED, left as it was: "
+                                    + _xcheck_use_label(use, ctx))
+                    continue
+                if use_groups and not _xcheck_match_group(use["item"], src_group):
+                    problems.append("colour group not changed: "
+                                    + _xcheck_use_label(use, ctx))
+                reasons = _xcheck_differences(
+                    src_fp, _xcheck_fingerprint(use["item"], ctx["lut_path"]),
+                    use_groups)
+                if reasons:
+                    totals["differs"] += 1
+                    problems.append(f"copied, but {', '.join(reasons)} still"
+                                    f" differ -- worth an eyeball: "
+                                    + _xcheck_use_label(use, ctx))
+                else:
+                    matched += 1
+        totals["matched"] += matched
+        n_targets = sum(len(u) for u in by_timeline.values())
+        line = (f"{conflict['name']}: {chosen['letter']} -> {matched} of"
+                f" {n_targets} clip(s) now match")
+        log("  " + line)
+        body.append(line)
+        for problem in problems:
+            log("    " + problem)
+            body.append("    " + problem)
+    return totals, body
+
+
+# --- Panel button -----------------------------------------------------------
+def on_colour_cross_check(ev):
+    project, _, _ = get_context()
+    if not project:
+        log("No project open.")
+        return
+    timelines = _xcheck_timelines(project)
+    if len(timelines) < 2:
+        log("Colour Cross Check needs at least two timelines in the project.")
+        return
+    names = [name for name, _ in timelines]
+    try:
+        project_key = project.GetUniqueId() or project.GetName()
+    except Exception:
+        project_key = None
+    remembered = XCHECK_STATE["ticked"].get(project_key)
+    if remembered is None:
+        current = project.GetCurrentTimeline()
+        remembered = [current.GetName()] if current else []
+
+    picked = xcheck_select_dialog(names, remembered, XCHECK_STATE["groups"])
+    if not picked:
+        log("Colour Cross Check cancelled.")
+        return
+    ticked, use_groups = picked
+    XCHECK_STATE["ticked"][project_key] = ticked
+    XCHECK_STATE["groups"] = use_groups
+    selected = [(name, tl) for name, tl in timelines if name in set(ticked)]
+
+    tmp = tempfile.mkdtemp(prefix="infinite_forms_xcheck_")
+    ctx = {"tmp": tmp, "lut_path": os.path.join(tmp, "grade.cube"),
+           "use_groups": use_groups, "layers": {}, "spans": {},
+           "tl_info": {}, "seq": 0, "moved": False, "choices": {},
+           "index": 0}
+    snapshot = _xcheck_snapshot(project)
+    try:
+        log(f"Colour Cross Check -- comparing {len(selected)} timeline(s)"
+            f" (progress prints to Workspace > Console)...")
+        conflicts, stats = xcheck_scan(selected, use_groups, ctx)
+        # Seen in testing: the project closed mid-scan and every LUT export
+        # after that failed. A result built from node tools alone would
+        # look complete while being blind to colour, so refuse it.
+        if stats["unreadable"] * 2 > stats["uses"]:
+            log(f"  Aborted -- {stats['unreadable']} of {stats['uses']} clip"
+                f" grade(s) couldn't be read. Nothing was changed.")
+            summary_dialog("Colour Cross Check", [
+                f"Resolve refused to export {stats['unreadable']} of"
+                f" {stats['uses']} clip grades,",
+                "so colour couldn't be compared. Nothing was changed.",
+                "",
+                "That happens when the project is closed or switched",
+                "during the scan, or Resolve is busy (rendering, a",
+                "settings window open). Try again once it's idle.",
+            ])
+            return
+        log(f"  {len(conflicts)} of {stats['shared']} shared shot(s) are"
+            f" graded differently ({stats['seconds']:.0f}s).")
+        if stats["unreadable"]:
+            log(f"  Note: {stats['unreadable']} clip grade(s) couldn't be"
+                f" exported as a LUT -- they show as their own variants,"
+                f" marked 'colour unreadable'.")
+        if not conflicts:
+            summary_dialog("Colour Cross Check", [
+                "No grade differences found.",
+                "",
+                f"{stats['shared']} shot(s) are used in more than one of the"
+                f" {len(selected)} timelines, and every use of each is graded"
+                f" the same.",
+            ])
+            return
+
+        while True:
+            if not xcheck_picker(project, conflicts, ctx):
+                log("Colour Cross Check cancelled -- nothing was changed.")
+                return
+            action = xcheck_review_dialog(conflicts, ctx["choices"])
+            if action[0] == "back":
+                continue
+            if action[0] == "cancel":
+                log("Colour Cross Check cancelled -- nothing was changed.")
+                return
+            keep_versions = action[1]
+            break
+
+        now_open, _, _ = get_context()
+        try:
+            same_project = bool(now_open) and (
+                (now_open.GetUniqueId() or now_open.GetName()) == project_key)
+        except Exception:
+            same_project = False
+        if not same_project:
+            log("Colour Cross Check -- the project was closed or switched"
+                " since the scan. Nothing was changed.")
+            summary_dialog("Colour Cross Check", [
+                "The project was closed or switched since the scan,",
+                "so the clips it found no longer exist. Nothing was",
+                "changed -- open the project and run it again.",
+            ])
+            return
+
+        log(f"Colour Cross Check -- applying {len(ctx['choices'])} choice(s)...")
+        totals, body = xcheck_apply(project, conflicts, ctx["choices"], ctx,
+                                    keep_versions)
+        header = [f"{totals['matched']} clip(s) now match their chosen grade."]
+        if totals["differs"] or totals["failed"] or totals["untouched"]:
+            header.append(f"{totals['differs']} still differ,"
+                          f" {totals['failed']} failed,"
+                          f" {totals['untouched']} left untouched"
+                          f" -- details below.")
+        if keep_versions:
+            header.append("Old grades are kept as local versions on each"
+                          " clip.")
+        skipped = len(conflicts) - len(ctx["choices"])
+        if skipped:
+            body += ["", f"{skipped} shot(s) skipped -- unchanged."]
+        report_dialog("Colour Cross Check -- Done", header, body)
+    finally:
+        if ctx["moved"]:
+            _xcheck_restore(project, snapshot)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 PHOTOGRAPHER_FOLDER_TEMPLATE = "TM - PHOTOGRAPHER - MONTH YEAR"
