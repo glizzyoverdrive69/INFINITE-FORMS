@@ -4119,7 +4119,6 @@ def _xcheck_build_conflict(variants, use_groups):
     letter them, note why each differs from A, and read the positions the
     picker shows -- only for shots that actually conflict."""
     variants.sort(key=lambda v: (_xcheck_is_ungraded(v["fp"]), -len(v["uses"])))
-    track_on = {}
     for index, variant in enumerate(variants):
         variant["letter"] = chr(65 + index) if index < 26 else f"#{index + 1}"
         variant["preview"] = None
@@ -4134,21 +4133,11 @@ def _xcheck_build_conflict(variants, use_groups):
                     use[field] = int(getattr(use["item"], getter)())
                 except Exception:
                     use[field] = None
-            # A disabled clip (an alternate parked on V2, say) or a switched-
-            # off track still counts as a use, but the edit doesn't show it:
-            # previewing it would grab whatever is underneath instead.
-            try:
-                use["clip_on"] = bool(use["item"].GetClipEnabled())
-            except Exception:
-                use["clip_on"] = True
-            key = (use["tl_name"], use["track"])
-            if key not in track_on:
-                try:
-                    track_on[key] = bool(use["tl"].GetIsTrackEnabled(
-                        "video", use["track"]))
-                except Exception:
-                    track_on[key] = True
-            use["track_on"] = track_on[key]
+            # Whether the clip and its track are enabled is NOT read here:
+            # Resolve reports every track of a timeline that isn't open as
+            # disabled. It's read once the timeline is opened for a preview
+            # (see _xcheck_check_visible); None means not known yet.
+            use["clip_on"] = use["track_on"] = None
     seen, split = {}, []
     for index, variant in enumerate(variants):
         for use in variant["uses"]:
@@ -4163,9 +4152,50 @@ def _xcheck_build_conflict(variants, use_groups):
 
 
 # --- Moving Resolve to a shot (previews, Show in Resolve) ------------------
+# Resolve only reports clip/track enable state truthfully for the timeline
+# that is OPEN: ask about any other timeline and every track comes back
+# disabled (tested on 20.2.1 -- all six tracks "off" until the timeline was
+# opened, all "on" while open, all "off" again after leaving). So anything
+# that reads enable state runs after _xcheck_open_timeline.
+def _xcheck_open_timeline(project, use, ctx):
+    """Color page + this use's timeline. True once it's the open one."""
+    ctx["moved"] = True
+    _xcheck_color_page()
+    try:
+        current = project.GetCurrentTimeline()
+        if current and current.GetUniqueId() == use["tl"].GetUniqueId():
+            return True
+        if not project.SetCurrentTimeline(use["tl"]):
+            return False
+    except Exception:
+        return False
+    time.sleep(XCHECK_SETTLE_SECONDS)     # let the switch land before reading
+    # Anything cached about this timeline may predate the person toggling
+    # tracks -- read it fresh now that it's open.
+    for key in [k for k in ctx["spans"] if k[0] == use["tl_name"]]:
+        del ctx["spans"][key]
+    return True
+
+
+def _xcheck_check_visible(use):
+    """Is this use's clip enabled and its track on? Only meaningful while
+    its timeline is open. The answer is kept on the use for its card."""
+    try:
+        use["clip_on"] = bool(use["item"].GetClipEnabled())
+    except Exception:
+        use["clip_on"] = True
+    try:
+        use["track_on"] = bool(use["tl"].GetIsTrackEnabled("video",
+                                                           use["track"]))
+    except Exception:
+        use["track_on"] = True
+    return use["clip_on"] and use["track_on"]
+
+
 def _xcheck_cover_spans(use, ctx):
     """[(start, end)] of everything opaque, enabled and on an enabled
-    track above this use -- what would hide it in the viewer."""
+    track above this use -- what would hide it in the viewer. Only valid
+    while the use's timeline is open."""
     timeline = use["tl"]
     spans = []
     for track, opaque in ctx["layers"].get(use["tl_name"], {}).items():
@@ -4207,21 +4237,15 @@ def _xcheck_clear_frame(use, ctx):
     return start + length // 2, True
 
 
-def _xcheck_use_visible(use):
-    """Does this use actually show in its edit right now? Read live -- an
-    editor soloing tracks mid-review changes the answer."""
-    try:
-        if not use["item"].GetClipEnabled():
-            return False
-        return bool(use["tl"].GetIsTrackEnabled("video", use["track"]))
-    except Exception:
-        return True
+def _xcheck_known_hidden(use):
+    """True only when a check (with its timeline open) found it hidden."""
+    return use.get("clip_on") is False or use.get("track_on") is False
 
 
 def _xcheck_preview_source(conflict):
     """The source frame to preview every variant at, so the cards show the
     same moment with different grades rather than different moments. It's
-    the frame inside a visible use of the most variants (ideally all)."""
+    the frame inside a use of the most variants (ideally all)."""
     if "preview_src" in conflict:
         return conflict["preview_src"]
     ranges = [(index, use["src_start"], use["src_end"])
@@ -4229,7 +4253,7 @@ def _xcheck_preview_source(conflict):
               for use in variant["uses"]
               if use.get("src_start") is not None
               and use.get("src_end") is not None
-              and use.get("clip_on", True) and use.get("track_on", True)]
+              and not _xcheck_known_hidden(use)]
     candidates = {(a + b) // 2 for _, a, b in ranges}
     for i, (vi, a1, b1) in enumerate(ranges):
         for vj, a2, b2 in ranges[i + 1:]:
@@ -4259,20 +4283,15 @@ def _xcheck_frame_for_source(use, source_frame):
 def _xcheck_park(project, use, ctx, frame=None):
     """Bring Resolve to one use of a shot: Color page, its timeline, the
     playhead on it. Returns True if the playhead was placed."""
+    if not _xcheck_open_timeline(project, use, ctx):
+        return False
     if frame is None:
         frame, _covered = _xcheck_clear_frame(use, ctx)
         if frame is None:
             return False
-    ctx["moved"] = True
-    _xcheck_color_page()
-    timeline = use["tl"]
-    try:
-        project.SetCurrentTimeline(timeline)
-    except Exception:
-        return False
     info = _xcheck_timeline_info(use, ctx)
     try:
-        return bool(timeline.SetCurrentTimecode(
+        return bool(use["tl"].SetCurrentTimecode(
             _xcheck_frames_to_tc(frame, info["base"], info["drop"])))
     except Exception:
         return False
@@ -4324,35 +4343,41 @@ def _xcheck_grab_preview(project, conflict, variant, ctx):
     """Export the frame Resolve shows for one use of this variant as its
     preview. Only uses that are visible in their edit qualify -- grabbing a
     disabled clip's frame captured the clip underneath it (a different
-    shot). Prefers the conflict's shared source frame so all cards show the
-    same moment. A variant that can't be previewed is marked "" with the
-    reason in preview_why, so it isn't retried."""
+    shot) -- and that is only knowable with the timeline open, so each use
+    is opened before it's judged. Prefers the conflict's shared source
+    frame so all cards show the same moment. A variant that can't be
+    previewed is marked "" with what stopped it in preview_why: a list of
+    (what, timeline) pairs."""
     if variant.get("preview") is not None:
         return
     variant["preview"] = ""
-    visible = [use for use in variant["uses"] if _xcheck_use_visible(use)]
-    if not visible:
-        variant["preview_why"] = ("Disabled clip or track in every timeline"
-                                  " -- nothing on screen to preview.")
-        return
-    variant["preview_why"] = "Hidden under a clip above, or the grab failed."
+    reasons = []
     source_frame = _xcheck_preview_source(conflict)
-    # Uses that contain the shared frame first, then any other visible use.
-    visible.sort(key=lambda u: _xcheck_frame_for_source(u, source_frame) is None)
-    for use in visible[:3]:
+    # Not-known-hidden uses first, then those containing the shared frame.
+    uses = sorted(variant["uses"], key=lambda u: (
+        _xcheck_known_hidden(u),
+        _xcheck_frame_for_source(u, source_frame) is None))
+    for use in uses[:3]:
+        where = _xcheck_elide(use["tl_name"])
+        if not _xcheck_open_timeline(project, use, ctx):
+            reasons.append(("couldn't open", where))
+            continue
+        if not _xcheck_check_visible(use):
+            reasons.append(("clip is disabled" if use["clip_on"] is False
+                            else f"V{use['track']} is switched off", where))
+            continue
         frame = _xcheck_frame_for_source(use, source_frame)
         same = frame is not None and not any(
             s <= frame < e for s, e in _xcheck_cover_spans(use, ctx))
         if not same:
             frame, covered = _xcheck_clear_frame(use, ctx)
             if frame is None or covered:
+                reasons.append(("hidden under a clip above", where))
                 continue
-        switching = project.GetCurrentTimeline() is None or (
-            project.GetCurrentTimeline().GetUniqueId() != use["tl"].GetUniqueId())
         if not _xcheck_park(project, use, ctx, frame):
+            reasons.append(("couldn't move the playhead", where))
             continue
-        # A timeline switch takes longer to land than a playhead move.
-        time.sleep(XCHECK_SETTLE_SECONDS * (2 if switching else 1))
+        time.sleep(XCHECK_SETTLE_SECONDS)
         ctx["seq"] += 1
         # Unique names: Qt caches images by path, and a reused path would
         # show the previous shot.
@@ -4372,6 +4397,8 @@ def _xcheck_grab_preview(project, conflict, variant, ctx):
             variant["preview_aspect"] = _xcheck_timeline_info(use, ctx)["aspect"]
             variant["preview_same"] = same
             return
+        reasons.append(("Resolve wouldn't export a frame", where))
+    variant["preview_why"] = reasons
 
 
 def _xcheck_snapshot(project):
@@ -4774,9 +4801,11 @@ def _xcheck_thumb_html(variant, width, same_frame_note):
                      ' the other previews</span>')
         return html
     if path == "":
-        return ('<span style="color:#8A9384;">No preview: '
-                + _html_escape(variant.get("preview_why") or "grab failed.")
-                + '<br>Show in Resolve works for every variant.</span>')
+        lines = ["<b>No preview</b>"]
+        for what, where in (variant.get("preview_why") or [])[:2]:
+            lines += [_html_escape(what), " in " + _html_escape(where)]
+        lines += ["Fix it and press Grab previews,", "or use Show in Resolve."]
+        return '<span style="color:#8A9384;">' + "<br>".join(lines) + "</span>"
     return '<span style="color:#8A9384;">No preview yet</span>'
 
 
@@ -4994,6 +5023,17 @@ def xcheck_picker(project, conflicts, ctx):
         if any(v.get("preview") is None for v in visible_variants()):
             kick()
 
+    def on_grab_button(_ev=None):
+        """The button also retries cards that failed -- after a track has
+        been switched on or a clip enabled, say. Auto previews don't, so
+        moving between shots never loops on a dead card."""
+        for variant in visible_variants():
+            if variant.get("preview") == "":
+                variant["preview"] = None
+        current().pop("preview_src", None)
+        render()
+        grab()
+
     def on_pump(_ev=None):
         if state["closed"]:
             return
@@ -5048,9 +5088,12 @@ def xcheck_picker(project, conflicts, ctx):
             variant["show_next"] += 1
             use = uses[n]
             if _xcheck_park(project, use, ctx):
+                # The timeline is open now, so its enable state is real.
+                visible = _xcheck_check_visible(use)
+                render()
                 status(f"Showing {variant['letter']} ({n + 1} of {len(uses)}):"
                        f" {_xcheck_use_label(use, ctx)}"
-                       + ("" if _xcheck_use_visible(use) else
+                       + ("" if visible else
                           " -- DISABLED here, so the viewer shows what's"
                           " underneath")
                        + (" -- click again for the next use"
@@ -5104,7 +5147,7 @@ def xcheck_picker(project, conflicts, ctx):
         getattr(dlg.On, f"BtnXPUse_{slot}").Clicked = guard(make_use(slot))
         getattr(dlg.On, f"BtnXPShow_{slot}").Clicked = guard(make_show(slot))
     dlg.On.BtnXPMore.Clicked = guard(on_more)
-    dlg.On.BtnXPGrab.Clicked = guard(grab)
+    dlg.On.BtnXPGrab.Clicked = guard(on_grab_button)
     dlg.On.BtnXPPrev.Clicked = guard(lambda _ev=None: go(ctx["index"] - 1))
     dlg.On.BtnXPNext.Clicked = guard(lambda _ev=None: go(ctx["index"] + 1))
     dlg.On.BtnXPSkip.Clicked = guard(on_skip)
