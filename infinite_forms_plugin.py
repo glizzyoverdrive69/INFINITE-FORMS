@@ -41,7 +41,9 @@ UPDATE_PLUGIN_FILENAME = "infinite_forms_plugin.py"
 UPDATE_STARTUP_DIALOG = True
 
 import base64
+import hashlib
 import importlib.machinery
+import json
 import importlib.util
 import os
 from difflib import SequenceMatcher
@@ -3743,8 +3745,10 @@ def on_match_grades(ev):
 #           colour-domain change, down to a nudged wheel or a qualifier.
 #   tools   which tools each node uses. Catches the spatial work a LUT
 #           can't hold (windows, NR, blur...). Empty nodes are ignored,
-#           and window POSITIONS aren't compared -- a reframed shot often
-#           needs its windows moved.
+#           and window POSITIONS and TRACKING aren't compared -- a reframed
+#           shot often needs its windows moved, and CopyGrades doesn't carry
+#           tracking across (it's tied to the clip's own frames), so it
+#           would flag the same shot after every apply.
 #   group   the clip's colour group, whose pre/post-clip grades are part of
 #           the look. Optional, for timelines meant to sit in different
 #           client groups.
@@ -3766,6 +3770,15 @@ XCHECK_PICKER_GEOMETRY = (80, 60, 1240, 780)
 XCHECK_NAME_CHARS = 34            # longer timeline names are middle-elided
 XCHECK_SETTLE_SECONDS = 0.35      # let Resolve land on a frame before a grab
 XCHECK_VERSION_PREFIX = "Cross Check"
+# Node tools that are per-clip analysis, not part of the look.
+XCHECK_IGNORED_TOOL_WORDS = ("Tracking", "Stabiliz")
+# Resolve keeps no time for a grade change (nor does a Cloud project's
+# database live on this Mac), so Cross Check keeps its own history: every
+# scan fingerprints each use, and a changed fingerprint means the grade
+# changed between that scan and the previous one.
+XCHECK_HISTORY_PATH = os.path.expanduser(
+    "~/Library/Application Support/Infinite Forms/cross_check_history.json")
+XCHECK_HISTORY_KEEP_DAYS = 120
 # Source types that carry no grade worth comparing.
 XCHECK_NOT_GRADED_TYPES = ("title", "generator", "matte")
 # Source types that don't hide the shot underneath them, so a preview can
@@ -3817,8 +3830,10 @@ def _xcheck_node_tools(item):
             tools = []
         if isinstance(tools, dict):
             tools = list(tools.values())
+        tools = [str(t) for t in tools
+                 if not any(w in str(t) for w in XCHECK_IGNORED_TOOL_WORDS)]
         if tools:
-            signature.append(tuple(sorted(str(t) for t in tools)))
+            signature.append(tuple(sorted(tools)))
     return count, tuple(sorted(signature))
 
 
@@ -3888,6 +3903,149 @@ def _xcheck_is_ungraded(fp):
     return fp["tools"] == ()
 
 
+# --- Grade history (when did a grade last change?) --------------------------
+XCHECK_VERSION_RE = re.compile(r"^Cross Check (\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
+
+
+def _xcheck_fp_hash(fp):
+    """Stable digest of a fingerprint, for the history file. Exports are
+    bit-identical for an unchanged grade, so any difference is a change."""
+    lut = fp["lut"]
+    colour = "none" if lut is None else ",".join(f"{v:.4f}" for v in lut)
+    return hashlib.sha1(f"{colour}|{fp['tools']!r}|{fp['group']}"
+                        .encode("utf-8")).hexdigest()
+
+
+def _xcheck_history_load(project_key):
+    """(whole file, this project's {use key: entry}). Never raises -- a
+    missing or damaged file just means no history yet."""
+    try:
+        with open(XCHECK_HISTORY_PATH, "r") as handle:
+            data = json.load(handle)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    project = data.get(str(project_key))
+    if not isinstance(project, dict):
+        project = data[str(project_key)] = {}
+    return data, project
+
+
+def _xcheck_history_save(data):
+    """Write the history atomically, dropping uses not seen for months."""
+    cutoff = time.time() - XCHECK_HISTORY_KEEP_DAYS * 86400
+    for project in data.values():
+        if isinstance(project, dict):
+            for key in [k for k, e in project.items()
+                        if not isinstance(e, dict)
+                        or e.get("last_seen", 0) < cutoff]:
+                del project[key]
+    try:
+        os.makedirs(os.path.dirname(XCHECK_HISTORY_PATH), exist_ok=True)
+        partial = XCHECK_HISTORY_PATH + ".tmp"
+        with open(partial, "w") as handle:
+            json.dump(data, handle)
+        os.replace(partial, XCHECK_HISTORY_PATH)
+    except Exception:
+        log_quiet("Colour Cross Check: couldn't save the grade history.")
+
+
+def _xcheck_use_key(use, ctx):
+    """One use's identity across sessions: its timeline's and its own
+    unique ids."""
+    if "key" not in use:
+        try:
+            ids = ctx.setdefault("tl_ids", {})
+            if use["tl_name"] not in ids:
+                ids[use["tl_name"]] = use["tl"].GetUniqueId()
+            use["key"] = f"{ids[use['tl_name']]}|{use['item'].GetUniqueId()}"
+        except Exception:
+            use["key"] = None
+    return use["key"]
+
+
+def _xcheck_version_time(item):
+    """When Cross Check put this clip's current grade there, read from the
+    "Cross Check YYYY-MM-DD HH:MM" version it created -- or None."""
+    try:
+        name = (item.GetCurrentVersion() or {}).get("versionName") or ""
+        match = XCHECK_VERSION_RE.match(name)
+        if match:
+            return time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M"))
+    except Exception:
+        pass
+    return None
+
+
+def _xcheck_note_grade(ctx, use, fp, applied=False):
+    """Record this use's grade in the history and set use["change"] to the
+    latest known change, (earliest, latest, "applied"|"seen"), or None."""
+    now = time.time()
+    history = ctx.get("history")
+    key = _xcheck_use_key(use, ctx)
+    digest = _xcheck_fp_hash(fp)
+    entry = None
+    if history is not None and key:
+        entry = history.get(key)
+        if not isinstance(entry, dict):
+            entry = history[key] = {"hash": digest, "first_seen": now,
+                                    "last_seen": now, "changed": None}
+        elif applied:
+            entry.update(hash=digest, last_seen=now, changed=[now, now])
+        elif entry.get("hash") != digest:
+            # Changed some time after the last scan that saw the old grade.
+            entry.update(hash=digest, changed=[entry.get("last_seen", now), now],
+                         last_seen=now)
+        else:
+            entry["last_seen"] = now
+    known = []
+    if applied:
+        known.append((now, now, "applied"))
+    else:
+        stamped = _xcheck_version_time(use["item"])
+        if stamped:
+            known.append((stamped, stamped, "applied"))
+    if entry and entry.get("changed"):
+        low, high = entry["changed"]
+        known.append((low, high, "applied" if low == high else "seen"))
+    use["change"] = max(known, key=lambda c: c[1]) if known else None
+    use["first_seen"] = entry.get("first_seen") if entry else None
+
+
+def _xcheck_when(stamp, since=None):
+    """'9 Oct 13:05' -- or just '13:05' when `since` is the same day."""
+    moment = time.localtime(stamp)
+    if since is not None and time.localtime(since)[:3] == moment[:3]:
+        return time.strftime("%H:%M", moment)
+    text = f"{moment.tm_mday} {time.strftime('%b %H:%M', moment)}"
+    if moment.tm_year != time.localtime().tm_year:
+        text = f"{moment.tm_mday} {time.strftime('%b %Y %H:%M', moment)}"
+    return text
+
+
+def _xcheck_last_change(variant, ctx):
+    """(time to rank by or None, card line) for the most recent known grade
+    change across a variant's uses."""
+    best = None
+    for use in variant["uses"]:
+        change = use.get("change")
+        if change and (best is None or change[1] > best[1]):
+            best = change
+    if best:
+        low, high, how = best
+        if how == "applied":
+            return high, f"Grade applied by Cross Check {_xcheck_when(high)}"
+        return high, (f"Grade changed between {_xcheck_when(low)}"
+                      f" and {_xcheck_when(high, low)}")
+    firsts = [u["first_seen"] for u in variant["uses"] if u.get("first_seen")]
+    if not firsts:
+        return None, "No grade history"
+    if min(firsts) >= ctx.get("scan_started", 0) - 1:
+        return None, "First check -- changes show from next run"
+    return None, f"No change seen since {_xcheck_when(min(firsts))}"
+
+
 def _xcheck_tc_to_frames(tc, base, drop):
     parts = re.split(r"[:;.,]", (tc or "").strip())
     if len(parts) != 4:
@@ -3953,30 +4111,9 @@ def _xcheck_timeline_info(use, ctx):
         width, height = 16.0, 9.0
     if width <= 0 or height <= 0:
         width, height = 16.0, 9.0
-    added, added_text = _xcheck_timeline_added(timeline)
-    info = {"base": base, "drop": drop, "aspect": width / height,
-            "added": added, "added_text": added_text}
+    info = {"base": base, "drop": drop, "aspect": width / height}
     ctx["tl_info"][use["tl_name"]] = info
     return info
-
-
-def _xcheck_timeline_added(timeline):
-    """(epoch, "9 Oct 11:10") for when the timeline was created, from its
-    Media Pool "Date Added". Resolve leaves Date Modified/Created blank for
-    timelines and records no time for a grade, so this is the closest
-    thing to "newest" there is: each revision is a new timeline."""
-    try:
-        raw = timeline.GetMediaPoolItem().GetClipProperty("Date Added") or ""
-    except Exception:
-        return None, ""
-    try:
-        parsed = time.strptime(" ".join(raw.split()), "%a %b %d %Y %H:%M:%S")
-    except ValueError:
-        return None, raw
-    text = f"{parsed.tm_mday} {time.strftime('%b %H:%M', parsed)}"
-    if parsed.tm_year != time.localtime().tm_year:
-        text = f"{parsed.tm_mday} {time.strftime('%b %Y %H:%M', parsed)}"
-    return time.mktime(parsed), text
 
 
 def _xcheck_elide(name, limit=XCHECK_NAME_CHARS):
@@ -4028,8 +4165,20 @@ def xcheck_scan(timelines, use_groups, ctx):
     them and split the uses into grade variants. Read-only throughout.
 
     A generator for xcheck_progress: yields (done, total, detail) between
-    small steps and returns (conflicts, stats)."""
-    started = time.time()
+    small steps and returns (conflicts, stats). Every grade it reads is
+    recorded in the grade history -- saved even if the scan is stopped,
+    since those are real observations."""
+    ctx["history_data"], ctx["history"] = _xcheck_history_load(
+        ctx.get("project_key"))
+    try:
+        result = yield from _xcheck_scan_steps(timelines, use_groups, ctx)
+    finally:
+        _xcheck_history_save(ctx["history_data"])
+    return result
+
+
+def _xcheck_scan_steps(timelines, use_groups, ctx):
+    started = ctx["scan_started"] = time.time()
     _xcheck_color_page()
     uses_by_source, order, gradable, types = {}, [], {}, {}
     n_items = 0
@@ -4097,6 +4246,7 @@ def xcheck_scan(timelines, use_groups, ctx):
                    f" {use['tl_name']}")
             fp = _xcheck_fingerprint(use["item"], ctx["lut_path"])
             use["group"] = fp["group"]
+            _xcheck_note_grade(ctx, use, fp)
             if fp["lut"] is None:
                 unreadable += 1
             for variant in variants:
@@ -4736,14 +4886,7 @@ def _xcheck_tool_summary(signature, width=None):
     return lines
 
 
-def _xcheck_newest(variant, ctx):
-    """Creation time of the newest timeline this variant is used in."""
-    stamps = [_xcheck_timeline_info(u, ctx)["added"] for u in variant["uses"]]
-    stamps = [s for s in stamps if s is not None]
-    return max(stamps) if stamps else None
-
-
-def _xcheck_variant_html(variant, chosen, newest, use_groups, ctx):
+def _xcheck_variant_html(variant, chosen, latest, use_groups, ctx):
     """(card HTML, line count). Every line is short and broken by hand --
     a word-wrapped label in a layout clips its last lines on resize, which
     is how a third timeline went missing from a card."""
@@ -4754,9 +4897,9 @@ def _xcheck_variant_html(variant, chosen, newest, use_groups, ctx):
             f'<b>{variant["letter"]}</b></span>')
     if chosen:
         head += ' &nbsp;<span style="color:#B7E36B;"><b>✓ CHOSEN</b></span>'
-    if newest:
-        head += (' &nbsp;<span style="color:#7FC8E8;"><b>NEWEST'
-                 ' TIMELINE</b></span>')
+    if latest:
+        head += (' &nbsp;<span style="color:#7FC8E8;"><b>LATEST'
+                 ' CHANGE</b></span>')
     if _xcheck_is_ungraded(fp):
         look = warn.format("<b>UNGRADED</b>") + " -- empty node tree"
     else:
@@ -4774,12 +4917,9 @@ def _xcheck_variant_html(variant, chosen, newest, use_groups, ctx):
     if variant["reasons"]:
         lines.append(warn.format("Differs from A: "
                                  + ", ".join(variant["reasons"])))
-    stamp = _xcheck_newest(variant, ctx)
-    if stamp is not None:
-        texts = [_xcheck_timeline_info(u, ctx)["added_text"]
-                 for u in variant["uses"]
-                 if _xcheck_timeline_info(u, ctx)["added"] == stamp]
-        lines.append(grey.format(f"Timeline created {texts[0]}"))
+    stamp, change_text = _xcheck_last_change(variant, ctx)
+    lines.append((('<span style="color:#7FC8E8;">{}</span>' if stamp is not None
+                   else grey).format(_html_escape(change_text))))
     lines.append(f"<b>Used {len(variant['uses'])}x:</b>")
     for use in variant["uses"][:XCHECK_USES_LISTED]:
         name, detail = _xcheck_use_lines(use, ctx)
@@ -4862,11 +5002,14 @@ def xcheck_picker(project, conflicts, ctx):
                         ui.Label({"ID": "XPHeader", "Text": "", "Weight": 1}),
                         ui.Label({"ID": "XPTally", "Text": "", "Weight": 0}),
                     ]),
-                    ui.Label({"Text": '<span style="color:#8A9384;">NEWEST'
-                                      ' TIMELINE marks the variant from the most'
-                                      ' recently created timeline -- Resolve'
-                                      ' doesn\'t record when a grade itself'
-                                      ' changed.</span>',
+                    ui.Label({"Text": '<span style="color:#8A9384;">LATEST'
+                                      ' CHANGE marks the most recently changed'
+                                      ' grade. Resolve doesn\'t timestamp grades,'
+                                      ' so Cross Check notices changes between'
+                                      ' its own runs<br>and knows when it'
+                                      ' applied a grade itself -- the more often'
+                                      ' it runs during a job, the more it'
+                                      ' knows.</span>',
                               "Weight": 0}),
                     # No WordWrap on these (see the timeline picker): the
                     # note carries its own <br>, and status gets a full row.
@@ -4938,19 +5081,25 @@ def xcheck_picker(project, conflicts, ctx):
             " deliberate.</span>"
             if conflict["split"] else "")
 
-        # NEWEST TIMELINE goes on one variant only, and only when there is
-        # a clear winner.
-        stamps = [_xcheck_newest(v, ctx) for v in variants]
+        # LATEST CHANGE goes on one variant only, and only when its last
+        # known change is strictly the most recent.
+        stamps = [_xcheck_last_change(v, ctx)[0] for v in variants]
         known = [s for s in stamps if s is not None]
-        newest = (max(known) if known and stamps.count(max(known)) == 1
-                  and len(set(known)) > 1 else None)
+        latest = (max(known) if known and stamps.count(max(known)) == 1
+                  else None)
         shown = list(range(offset, min(offset + XCHECK_CARD_SLOTS,
                                        len(variants))))
         infos = {i: _xcheck_variant_html(variants[i], i == chosen,
                                          stamps[i] is not None
-                                         and stamps[i] == newest,
+                                         and stamps[i] == latest,
                                          ctx["use_groups"], ctx)
                  for i in shown}
+        # Same number of text lines in every card, so the previews above
+        # them line up -- they sit at the bottom of their space, which
+        # ended at a different height for each card.
+        tallest = max(n for _, n in infos.values())
+        infos = {i: (html + "<br>&nbsp;" * (tallest - n), tallest)
+                 for i, (html, n) in infos.items()}
         for slot in range(XCHECK_CARD_SLOTS):
             index = offset + slot
             try:
@@ -5386,9 +5535,9 @@ def _xcheck_apply_one(src_item, src_fp, src_group, use, ctx, keep_versions,
     if ctx["use_groups"]:
         _xcheck_match_group(use["item"], src_group)
     # Re-read the target: the report says what landed, not what was tried.
-    reasons = _xcheck_differences(
-        src_fp, _xcheck_fingerprint(use["item"], ctx["lut_path"]),
-        ctx["use_groups"])
+    landed = _xcheck_fingerprint(use["item"], ctx["lut_path"])
+    _xcheck_note_grade(ctx, use, landed, applied=True)
+    reasons = _xcheck_differences(src_fp, landed, ctx["use_groups"])
     if reasons:
         return "differs", (f"copied, but {', '.join(reasons)} still differ"
                            f" -- worth an eyeball: {label}")
@@ -5400,7 +5549,19 @@ def xcheck_apply(project, conflicts, choices, ctx, keep_versions, report):
 
     A generator for xcheck_progress, one target clip per step. Results go
     into `report` as they happen ("totals", "body"), so a run stopped
-    part-way still reports exactly what changed."""
+    part-way still reports exactly what changed. Each change is stamped in
+    the grade history."""
+    try:
+        result = yield from _xcheck_apply_steps(project, conflicts, choices,
+                                                ctx, keep_versions, report)
+    finally:
+        if "history_data" in ctx:
+            _xcheck_history_save(ctx["history_data"])
+    return result
+
+
+def _xcheck_apply_steps(project, conflicts, choices, ctx, keep_versions,
+                        report):
     version_name = f"{XCHECK_VERSION_PREFIX} {time.strftime('%Y-%m-%d %H:%M')}"
     totals = report.setdefault("totals", {"matched": 0, "differs": 0,
                                           "failed": 0, "untouched": 0})
@@ -5487,7 +5648,7 @@ def on_colour_cross_check(ev):
     ctx = {"tmp": tmp, "lut_path": os.path.join(tmp, "grade.cube"),
            "use_groups": use_groups, "layers": {}, "spans": {},
            "tl_info": {}, "seq": 0, "moved": False, "choices": {},
-           "index": 0}
+           "index": 0, "project_key": project_key}
     snapshot = _xcheck_snapshot(project)
     try:
         log(f"Colour Cross Check -- comparing {len(selected)} timeline(s)...")
