@@ -4900,13 +4900,12 @@ def _xcheck_variant_html(variant, chosen, latest, use_groups, ctx):
     if latest:
         head += (' &nbsp;<span style="color:#7FC8E8;"><b>LATEST'
                  ' CHANGE</b></span>')
+    lines = [head]
     if _xcheck_is_ungraded(fp):
-        look = warn.format("<b>UNGRADED</b>") + " -- empty node tree"
-    else:
-        look = f"{fp['nodes']} node(s)"
+        lines.append(warn.format("<b>UNGRADED</b>") + " -- nothing in its nodes")
     if fp["lut"] is None:
-        look += " " + warn.format("(colour unreadable)")
-    lines = [head, look]
+        lines.append(warn.format("Colour unreadable"))
+    lines.append(f"Nodes: {fp['nodes'] if fp['tools'] is not None else '?'}")
     if use_groups:
         lines.append("Group: " + _html_escape(fp["group"] or "none"))
     else:
