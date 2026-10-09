@@ -19,7 +19,7 @@ Requires DaVinci Resolve Studio -- the UIManager used here isn't available
 in the free version.
 """
 
-BUILD_TAG = "2026-10-01.2"
+BUILD_TAG = "2026-10-09.1"
 print(f"[Infinite Forms] script starting -- build {BUILD_TAG}")
 
 # --- Auto-update -------------------------------------------------------
@@ -51,8 +51,10 @@ import re
 import shutil
 import ssl
 import struct
+import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import traceback
 import unicodedata
@@ -7265,17 +7267,78 @@ def on_bin_finder(ev):
 
 # ---------------------------------------------------------------------------
 # Auto-updater -- checks the GitHub repo's VERSION file at startup and,
-# when it differs from BUILD_TAG, offers a one-click self-update. The
-# downloaded file is VALIDATED before anything is touched (size sanity +
-# full compile -- a truncated download can't brick the install), the old
-# file is backed up alongside, and the swap is atomic.
+# when it names a NEWER build than BUILD_TAG, offers a one-click self-update
+# (header Update button, the launch popup, and Check for Update). The
+# downloaded file is VALIDATED before anything is touched (size, full
+# compile, end-of-file marker, and its BUILD_TAG matching VERSION), the old
+# file is backed up alongside, the swap is atomic, and what landed is
+# re-checked. Every failure offers the GitHub page instead.
 # ---------------------------------------------------------------------------
 UPDATE_STATE = {"available": False, "remote": "", "startup": None}
+UPDATE_MIN_BYTES = 50000                  # same floor as the installer
+UPDATE_EOF_SENTINEL = "# INFINITE-FORMS-EOF"
+UPDATE_BUILD_RE = re.compile(r'^BUILD_TAG = "([^"]+)"', re.MULTILINE)
 
 
 def _update_raw_url(filename):
+    # The throwaway query string gets past GitHub's ~5-minute raw-file
+    # cache, so a fresh release's VERSION and plugin file are read together
+    # instead of one new and one stale.
     return (f"https://raw.githubusercontent.com/{UPDATE_REPO}/"
-            f"{UPDATE_BRANCH}/{filename}")
+            f"{UPDATE_BRANCH}/{filename}?nocache={int(time.time())}")
+
+
+def _update_get(url, timeout):
+    """GET a URL -> (status, bytes or None), status being "ok", "private"
+    (HTTP 404), "certs" or "offline". Python's own HTTPS first; when that
+    can't verify GitHub's certificate (a python.org Python whose
+    certificates were never installed) curl gets a go, because it uses the
+    system trust store like Safari does. Never raises."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return "ok", response.read()
+    except urllib.error.HTTPError as err:
+        # HTTPError subclasses URLError, so it has to be caught first.
+        return ("private" if err.code == 404 else "offline"), None
+    except urllib.error.URLError as err:
+        status = ("certs" if isinstance(getattr(err, "reason", None),
+                                        ssl.SSLError) else "offline")
+    except ssl.SSLError:
+        status = "certs"
+    except Exception:
+        status = "offline"
+    if status == "certs":
+        try:
+            done = subprocess.run(["curl", "-fsSL", "--max-time",
+                                   str(int(timeout)), url],
+                                  capture_output=True, timeout=timeout + 5)
+            if done.returncode == 0:
+                return "ok", done.stdout
+            if done.returncode == 22:       # curl -f: HTTP error, i.e. 404
+                return "private", None
+        except Exception:
+            pass
+    return status, None
+
+
+def _build_key(tag):
+    """(2026, 10, 1, 2) for "2026-10-01.2" -- or None if it isn't one."""
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})\.(\d+)$", (tag or "").strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _update_compare(remote):
+    """"newer", "same" or "older": the repo's release against this build.
+    Only "newer" is an update -- a test build that's ahead of the release
+    used to be offered a "downgrade" back to it. Tags that aren't dated
+    fall back to: different means newer."""
+    if remote == BUILD_TAG:
+        return "same"
+    theirs, ours = _build_key(remote), _build_key(BUILD_TAG)
+    if theirs and ours:
+        return ("newer" if theirs > ours
+                else "same" if theirs == ours else "older")
+    return "newer"
 
 
 def _update_repo_page_url():
@@ -7304,25 +7367,15 @@ def _fetch_remote_version(timeout):
         ("offline", None)       -- no network, DNS, timeout, anything else
 
     Telling these apart matters, because each has a completely different
-    fix and only one of them is "check your wifi". Never raises -- an
-    update check must not be able to break anything."""
+    fix and only one of them is "check your wifi". ("certs" now only shows
+    when curl couldn't get through either -- see _update_get.) Never
+    raises -- an update check must not be able to break anything."""
     if not UPDATE_REPO:
         return ("offline", None)
-    try:
-        with urllib.request.urlopen(_update_raw_url("VERSION"),
-                                    timeout=timeout) as response:
-            return ("ok", response.read().decode("utf-8", "replace").strip())
-    except urllib.error.HTTPError as err:
-        # HTTPError subclasses URLError, so it has to be caught first.
-        return ("private" if err.code == 404 else "offline", None)
-    except urllib.error.URLError as err:
-        if isinstance(getattr(err, "reason", None), ssl.SSLError):
-            return ("certs", None)
-        return ("offline", None)
-    except ssl.SSLError:
-        return ("certs", None)
-    except Exception:
-        return ("offline", None)
+    status, data = _update_get(_update_raw_url("VERSION"), timeout)
+    if status != "ok":
+        return (status, None)
+    return ("ok", data.decode("utf-8", "replace").strip())
 
 
 def _update_result(status, remote):
@@ -7402,31 +7455,37 @@ def _update_result(status, remote):
                  "Whoever published the last release needs to",
                  "fill it in."])
 
-    if remote == BUILD_TAG:
+    comparison = _update_compare(remote)
+    if comparison == "same":
         return (f"Up to date -- {BUILD_TAG} is the latest build.",
                 "Up To Date",
                 ["You are up to date.",
                  "",
                  f"Installed build:   {BUILD_TAG}",
                  f"Latest release:    {remote}"])
+    if comparison == "older":
+        return (f"Up to date -- this build ({BUILD_TAG}) is newer than the"
+                f" latest release ({remote}).",
+                "Up To Date",
+                ["You are ahead of the latest release.",
+                 "",
+                 f"Installed build:   {BUILD_TAG}",
+                 f"Latest release:    {remote}",
+                 "",
+                 "This build hasn't been released yet, so there",
+                 "is nothing newer to update to."])
 
     lines = ["A newer build is available.",
              "",
              f"You have:          {BUILD_TAG}",
              f"Latest release:    {remote}",
              "",
-             "To update, download the project from:",
-             repo_url,
+             "Update now downloads it from GitHub, checks it,",
+             "keeps the version you have now as a .bak, and",
+             "installs it -- then reopen the panel to use it.",
              "",
-             "then double-click",
-             "\"One Click Install Infinite Forms.command\".",
-             "",
-             "It backs up the version you have now before",
-             "replacing it."]
-    if UPDATE_STATE["available"]:
-        lines += ["",
-                  "Or use the Update button in the panel header",
-                  "to install it in place."]
+             "Or open the GitHub page and download it yourself:",
+             repo_url]
     return (f"Update available: {remote} (this is {BUILD_TAG}).",
             "Update Available", lines)
 
@@ -7448,15 +7507,15 @@ def check_for_update():
     status, remote = _fetch_remote_version(3)
     message, title, lines = _update_result(status, remote)
 
-    if status == "ok" and remote and remote != BUILD_TAG:
+    if status == "ok" and remote and _update_compare(remote) == "newer":
         UPDATE_STATE["available"] = True
         UPDATE_STATE["remote"] = remote
 
-    if status == "ok" and remote == BUILD_TAG:
+    if status == "ok" and remote and _update_compare(remote) != "newer":
         # Confirm it in the panel log. No dialog -- nobody needs a popup to
         # say nothing changed -- but silence here is indistinguishable from
         # "the check never ran", which is exactly how this read before.
-        log(f"Update check: up to date ({BUILD_TAG}).")
+        log(f"Update check: {message}")
         return
     if status == "offline":
         # Transient and not actionable -- Console only, so a machine that
@@ -7465,37 +7524,32 @@ def check_for_update():
         return
 
     log(f"Update check: {message}")
-    UPDATE_STATE["startup"] = (title, lines)
+    UPDATE_STATE["startup"] = (status, remote, title, lines)
 
 
 def show_startup_update_notice():
     """Show the launch check's result, once the main panel exists so the
-    dialog has something to sit in front of. Set UPDATE_STARTUP_DIALOG to
-    False to keep launch findings in the log only."""
+    dialog has something to sit in front of -- with Update now / Open
+    GitHub page buttons when they apply. Set UPDATE_STARTUP_DIALOG to False
+    to keep launch findings in the log only."""
     if not UPDATE_STARTUP_DIALOG:
         return
     notice = UPDATE_STATE.get("startup")
     if not notice:
         return
     UPDATE_STATE["startup"] = None
-    title, lines = notice
     try:
-        summary_dialog(title, lines)
+        _update_show(*notice)
     except Exception:
         log(f"Could not show the update dialog:\n{traceback.format_exc()}")
 
 
 def on_check_for_update(_ev=None):
     """Manual update check, driven by the panel's Check for Update button.
-
-    Notify-only by design: it reads the repo's VERSION file, reports what
-    it finds, and tells you where to download from. It never writes to the
-    installed plugin -- that is the header Update button's job, and that
-    one only appears when the launch check already found something.
-
-    Deliberately does NOT set UPDATE_STATE either: the header button is
-    built once, when the window is built, so flipping that flag here would
-    promise a button that cannot appear until the next launch."""
+    Reports what it finds, and when a newer build exists offers to install
+    it on the spot (or open the GitHub page) -- the header Update button is
+    only built at launch, so this is the way in for a release published
+    while the panel was open."""
     if not UPDATE_REPO:
         message, title, lines = _update_result("unconfigured", None)
         log(message)
@@ -7510,7 +7564,215 @@ def on_check_for_update(_ev=None):
     status, remote = _fetch_remote_version(8)
     message, title, lines = _update_result(status, remote)
     log(message)
+    _update_show(status, remote, title, lines)
+
+
+def _update_show(status, remote, title, lines):
+    """The result dialog, with the buttons that make sense for it."""
+    if status == "ok" and remote and _update_compare(remote) == "newer":
+        choice = _update_choice_dialog(title, lines, [
+            ("page", "Open GitHub page"), ("later", "Later"),
+            ("update", "Update now")])
+        if choice == "update":
+            _update_run(remote)
+        elif choice == "page":
+            _update_open_repo_page()
+        return
+    if status in ("private", "offline", "certs"):
+        if _update_choice_dialog(title, lines, [
+                ("page", "Open GitHub page"), ("ok", "OK")]) == "page":
+            _update_open_repo_page()
+        return
     summary_dialog(title, lines)
+
+
+def _update_choice_dialog(title, lines, choices):
+    """summary_dialog with a row of buttons. choices = [(key, label)];
+    returns the clicked key, or None if the window was closed. Lines are
+    plain text kept short (see _update_result) -- no WordWrap, which clips."""
+    dlg_disp = bmd.UIDispatcher(ui)
+    result = {"choice": None}
+    dlg = dlg_disp.AddWindow(
+        {
+            "ID": "UpdateChoiceDlg",
+            "WindowTitle": title,
+            "Geometry": [240, 200, 470, 100 + 22 * len(lines)],
+            "StyleSheet": PANEL_QSS,
+        },
+        [
+            ui.VGroup(
+                {"Spacing": 6},
+                [ui.Label({"Text": line, "Weight": 0}) for line in lines]
+                + [ui.HGroup({"Spacing": 8, "Weight": 0}, [
+                    ui.Button({"ID": f"BtnUpd_{key}", "Text": label})
+                    for key, label in choices])],
+            )
+        ],
+    )
+
+    def make(key):
+        def on_click(_ev=None):
+            result["choice"] = key
+            dlg_disp.ExitLoop()
+        return on_click
+
+    for key, _label in choices:
+        getattr(dlg.On, f"BtnUpd_{key}").Clicked = make(key)
+    dlg.On.UpdateChoiceDlg.Close = lambda _ev=None: dlg_disp.ExitLoop()
+    hold_log_widget()
+    try:
+        dlg.Show()
+        run_loop_resilient(dlg_disp, "update dialog")
+        dlg.Hide()
+    finally:
+        release_log_widget()
+    return result["choice"]
+
+
+def _update_open_repo_page():
+    """Open the repo page in the default browser -- the way to update by
+    hand whenever the in-place update can't."""
+    url = _update_repo_page_url()
+    try:
+        subprocess.Popen(["open", url])
+        log(f"Opened {url} -- download the project there, then run"
+            f" \"One Click Install Infinite Forms.command\".")
+    except Exception:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            log(f"Open {url} in a browser to download the latest build.")
+
+
+def _update_validate(source, remote):
+    """None if the downloaded plugin is safe to install, else why not."""
+    size = len(source.encode("utf-8"))
+    if size < UPDATE_MIN_BYTES:
+        return f"it's only {size} bytes -- a cut-off download"
+    if not source.rstrip().endswith(UPDATE_EOF_SENTINEL):
+        # A truncation can land on a statement boundary and still compile
+        # -- the end-of-file marker catches exactly that.
+        return "its end-of-file marker is missing -- cut off"
+    try:
+        compile(source, UPDATE_PLUGIN_FILENAME, "exec")
+    except SyntaxError as err:
+        return f"it doesn't compile (line {err.lineno})"
+    except Exception:
+        return "it doesn't compile"
+    tag = UPDATE_BUILD_RE.search(source)
+    if not tag:
+        return "it has no BUILD_TAG -- not the plugin file"
+    if tag.group(1) != remote:
+        return (f"it's build {tag.group(1)}, not {remote} -- GitHub is still"
+                f" serving the old file")
+    return None
+
+
+def _update_install(remote):
+    """Download the release, check it, back this build up, swap it in and
+    check what landed. Returns (ok, dialog lines). The new file is written
+    beside the old one and swapped atomically, so a failure part-way never
+    leaves a half-written plugin -- and a bad result is rolled back."""
+    status, data = _update_get(_update_raw_url(UPDATE_PLUGIN_FILENAME), 30)
+    if status != "ok":
+        reason = {"private": "GitHub says the repo is private or gone.",
+                  "certs": "GitHub's certificate couldn't be verified.",
+                  }.get(status, "GitHub couldn't be reached.")
+        return False, ["The download didn't work.", "", reason, "",
+                       "Nothing was changed."]
+    try:
+        source = data.decode("utf-8")
+    except UnicodeDecodeError:
+        source = ""
+    problem = _update_validate(source, remote)
+    if problem:
+        lines = ["The download failed its checks:", ""]
+        lines += textwrap.wrap(problem[0].upper() + problem[1:] + ".", 50)
+        if "old file" in problem:
+            lines += ["", "GitHub refreshes within a few minutes of a",
+                      "release -- try again shortly."]
+        return False, lines + ["", "Nothing was changed."]
+
+    target = PLUGIN_FILE_PATH
+    backup, partial = target + ".bak", target + ".new"
+    try:
+        with open(partial, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        os.chmod(partial, 0o644)
+        if os.path.isfile(target):
+            shutil.copy2(target, backup)
+        os.replace(partial, target)
+    except Exception as err:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        return False, ["Couldn't write the new version:", "",
+                       str(err)[:50], "", "Nothing was changed."]
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            landed = handle.read()
+        if _update_validate(landed, remote) is not None:
+            raise ValueError("installed file failed validation")
+    except Exception:
+        try:
+            shutil.copy2(backup, target)
+        except Exception:
+            pass
+        return False, ["The installed file didn't check out, so the",
+                       "previous version was put back.", "",
+                       "Nothing was changed."]
+    return True, [f"Updated to {remote}.", "",
+                  "Close this panel and open it again from",
+                  "Workspace > Scripts > Utility to use it.", "",
+                  "The previous version is kept beside it as",
+                  os.path.basename(backup) + "."]
+
+
+def _update_run(remote):
+    """Install the release and report how it went."""
+    log(f"Downloading Infinite Forms {remote} from GitHub...")
+    ok, lines = _update_install(remote)
+    if not ok:
+        log("Update failed: " + " ".join(line for line in lines if line))
+        if _update_choice_dialog("Update Failed", lines, [
+                ("page", "Open GitHub page"), ("ok", "OK")]) == "page":
+            _update_open_repo_page()
+        return
+    UPDATE_STATE["available"] = False
+    try:
+        items["BtnUpdate"].Text = "Updated ✓"
+    except Exception:
+        pass
+    log(f"Updated to {remote}. Close the panel and reopen it from"
+        f" Workspace > Scripts > Utility to load it (previous version kept"
+        f" as {os.path.basename(PLUGIN_FILE_PATH)}.bak).")
+    if _update_choice_dialog("Updated", lines, [
+            ("later", "Later"), ("close", "Close panel now")]) == "close":
+        disp.ExitLoop()
+
+
+def on_apply_update(_ev=None):
+    """The header Update button -- only built when the launch check found a
+    newer release. (It pointed at a handler that was deleted in v0.5, so it
+    silently did nothing until this came back.)"""
+    remote = UPDATE_STATE.get("remote")
+    if not remote or not UPDATE_STATE.get("available"):
+        return
+    choice = _update_choice_dialog("Update Infinite Forms", [
+        f"Update from {BUILD_TAG} to {remote}?", "",
+        "Downloads it from GitHub, checks it, keeps the",
+        "version you have now as a .bak, then installs it.", "",
+        "Reopen the panel afterwards to use it."],
+        [("page", "Open GitHub page"), ("cancel", "Cancel"),
+         ("update", "Update now")])
+    if choice == "page":
+        _update_open_repo_page()
+    elif choice == "update":
+        _update_run(remote)
+    else:
+        log("Update cancelled.")
 
 
 # ---------------------------------------------------------------------------

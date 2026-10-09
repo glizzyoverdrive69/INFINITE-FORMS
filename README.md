@@ -79,31 +79,47 @@ To publish a new version:
 
 Both steps matter: the check compares the repo's `VERSION` against the
 installed `BUILD_TAG`, so a release that bumps only one of them is
-invisible to everyone.
+invisible to everyone. Keep the `YYYY-MM-DD.N` format: builds are ordered
+by it, so only a *newer* release is offered — a test build that's ahead of
+the release is never offered a "downgrade" back to it.
 
-There are three ways an installed copy finds out:
+There are three ways an installed copy finds out, and all three can
+install the update in place:
 
 - **Automatically at launch** — every time the panel opens it checks once,
   with a 3-second timeout so a slow network can't delay the window. The
   result always lands in the panel log, including "up to date", so you can
   see that it ran. Anything you have to act on — a new build, a private
-  repo, missing certificates — also pops the same dialog the button shows,
-  once the panel is up. Being offline is reported to the Console only, so a
-  machine that's offline on purpose isn't nagged every launch. Set
-  `UPDATE_STARTUP_DIALOG = False` to keep launch findings in the log only.
+  repo — also pops a dialog once the panel is up, with **Update now** and
+  **Open GitHub page** buttons. Being offline is reported to the Console
+  only, so a machine that's offline on purpose isn't nagged every launch.
+  Set `UPDATE_STARTUP_DIALOG = False` to keep launch findings in the log
+  only.
 - **Check for Update** at the bottom of the panel — the same check on
-  demand, with a fuller explanation in a dialog. It never touches the
-  installed file; it just tells you to download the project and re-run
-  the installer.
+  demand, with the same buttons. This is the way in for a release
+  published while the panel was already open.
 - **The Update button** in the panel header — appears only when the launch
-  check found a new build, and installs in place. Downloads are validated
-  (size + full compile + end-of-file marker) before replacing anything,
-  and the previous version is kept as a `.bak` alongside.
+  check found a new build.
 
-All three need `UPDATE_REPO` (top of the plugin file) pointing at a
+**Update now** downloads the plugin from GitHub and validates it before
+touching anything (size, full compile, end-of-file marker, and its
+`BUILD_TAG` matching `VERSION`, which catches GitHub still serving the
+previous file for a few minutes after a push). The previous version is kept
+as a `.bak` alongside, the swap is atomic, and the installed file is
+re-checked — a bad result is rolled back. Then close the panel and reopen it
+from Workspace > Scripts > Utility. If anything fails, the dialog offers
+**Open GitHub page** to download the project and run the installer by hand.
+Downloads fall back to `curl` when the Python Resolve uses has no HTTPS
+certificates, so a missing `Install Certificates.command` no longer blocks
+updates.
+
+Builds older than `2026-10-09.1` shipped with a dead Update button, so
+those machines need one manual update (download the project, run the
+installer); from then on the button works.
+
+All of this needs `UPDATE_REPO` (top of the plugin file) pointing at a
 **public** repo. While the repo is private, GitHub answers 404 to an
-unauthenticated request, and both the launch check and the button report
-**"repo set to private"**.
+unauthenticated request, and the check reports **"repo set to private"**.
 
 ## Notes
 
