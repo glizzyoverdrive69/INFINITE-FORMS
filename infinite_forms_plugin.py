@@ -4819,17 +4819,21 @@ def xcheck_picker(project, conflicts, ctx):
     dlg_disp = bmd.UIDispatcher(ui)
     choices = ctx["choices"]
     geometry = list(XCHECK_PICKER_GEOMETRY)
-    state = {"offset": 0, "apply": False, "ticks": 0, "closed": False,
-             "size": (geometry[2], geometry[3]), "rendered": None}
+    state = {"offset": 0, "apply": False, "ticks": 0, "fit_ticks": 0,
+             "closed": False, "thumb_w": XCHECK_THUMB_MIN_W * 2}
 
+    # The preview label takes all the spare height (Weight 1) and the
+    # picture is then fitted INSIDE it (see on_fit). Sizing the picture from
+    # the window instead cropped it: the label didn't grow to match, so a
+    # wide picture showed as a strip through its middle.
     cards = []
     for slot in range(XCHECK_CARD_SLOTS):
         cards.append(ui.VGroup({"ID": f"XPCard_{slot}", "Spacing": 4}, [
-            ui.Label({"ID": f"XPThumb_{slot}", "Text": "", "Weight": 0,
+            ui.Label({"ID": f"XPThumb_{slot}", "Text": "", "Weight": 1,
                       "MinimumSize": [XCHECK_THUMB_MIN_W, 96],
                       "Alignment": {"AlignHCenter": True,
-                                    "AlignVCenter": True}}),
-            ui.Label({"ID": f"XPInfo_{slot}", "Text": "", "Weight": 1,
+                                    "AlignBottom": True}}),
+            ui.Label({"ID": f"XPInfo_{slot}", "Text": "", "Weight": 0,
                       "Alignment": {"AlignLeft": True, "AlignTop": True}}),
             ui.HGroup({"Spacing": 4, "Weight": 0}, [
                 ui.Button({"ID": f"BtnXPShow_{slot}", "Text": "Show in Resolve"}),
@@ -4880,6 +4884,7 @@ def xcheck_picker(project, conflicts, ctx):
                                    "Weight": 0}),
                     ]),
                     ui.LineEdit({"ID": "XPPump", "Text": "", "Weight": 0}),
+                    ui.LineEdit({"ID": "XPFitPump", "Text": "", "Weight": 0}),
                     ui.HGroup({"Spacing": 6, "Weight": 0}, [
                         ui.Button({"ID": "BtnXPPrev", "Text": "< Previous shot",
                                    "Weight": 0}),
@@ -4901,6 +4906,7 @@ def xcheck_picker(project, conflicts, ctx):
     ditems = dlg.GetItems()
     try:
         ditems["XPPump"].Hidden = True
+        ditems["XPFitPump"].Hidden = True
     except Exception:
         pass
 
@@ -4945,9 +4951,6 @@ def xcheck_picker(project, conflicts, ctx):
                                          and stamps[i] == newest,
                                          ctx["use_groups"], ctx)
                  for i in shown}
-        width = thumb_width(len(shown), max(n for _, n in infos.values()),
-                            bool(conflict["split"]))
-        any_same = any(v.get("preview_same") for v in variants)
         for slot in range(XCHECK_CARD_SLOTS):
             index = offset + slot
             try:
@@ -4957,9 +4960,6 @@ def xcheck_picker(project, conflicts, ctx):
             if index >= len(variants):
                 continue
             variant = variants[index]
-            ditems[f"XPThumb_{slot}"].Text = _xcheck_thumb_html(
-                variant, width, any_same and variant.get("preview")
-                and not variant.get("preview_same"))
             ditems[f"XPInfo_{slot}"].Text = infos[index][0]
             try:
                 ditems[f"XPInfo_{slot}"].ToolTip = "\n".join(
@@ -4978,6 +4978,7 @@ def xcheck_picker(project, conflicts, ctx):
             last = min(offset + XCHECK_CARD_SLOTS, len(variants))
             ditems["BtnXPMore"].Text = (f"Variants {offset + 1}-{last}"
                                         f" of {len(variants)} >")
+        set_thumbs()
         # Cards appear and disappear between shots; without a fresh layout
         # a hidden card kept its column (or a returning one got none) until
         # the window was next resized.
@@ -4985,29 +4986,50 @@ def xcheck_picker(project, conflicts, ctx):
             dlg.RecalcLayout()
         except Exception:
             pass
-        state["rendered"] = state["size"]
+        kick_fit()          # the card count may have changed their width
 
-    def thumb_width(n_cards, info_lines, has_note):
-        """Preview width that fills a card and still leaves room for the
-        card's text and the rows of buttons below, for the current size."""
-        win_w, win_h = state["size"]
-        card_w = (win_w - 30 - 14 * (max(1, n_cards) - 1)) / max(1, n_cards)
-        aspect = next((v.get("preview_aspect") for v in visible_variants()
-                       if v.get("preview_aspect")), 16 / 9.0)
-        room_h = win_h - 270 - (40 if has_note else 0) - 19 * info_lines
-        width = min(card_w - 10, room_h * aspect)
-        return int(max(XCHECK_THUMB_MIN_W, width))
+    def caption_shown(variant):
+        """'Different moment' note under a preview -- only worth saying
+        when some other card IS at the shared frame."""
+        others = any(v.get("preview_same") for v in current()["variants"])
+        return bool(others and variant.get("preview")
+                    and not variant.get("preview_same"))
 
-    def on_resize(ev=None):
+    def set_thumbs():
+        for slot, variant in enumerate(visible_variants()):
+            ditems[f"XPThumb_{slot}"].Text = _xcheck_thumb_html(
+                variant, state["thumb_w"], caption_shown(variant))
+
+    def kick_fit():
+        state["fit_ticks"] += 1
+        ditems["XPFitPump"].Text = str(state["fit_ticks"])   # queues on_fit
+
+    def on_fit(_ev=None):
+        """Fit the whole frame inside the space the layout gave the first
+        preview label, keeping its aspect ratio. Runs a tick after any
+        render or resize, once the layout has settled."""
+        if state["closed"]:
+            return
         try:
-            size = ev["Size"]
-            state["size"] = (int(size[1]), int(size[2]))
+            geo = ditems["XPThumb_0"].Geometry
+            values = [geo[k] for k in sorted(geo)] if isinstance(geo, dict) \
+                else list(geo)
+            box_w, box_h = int(values[2]), int(values[3])
         except Exception:
             return
-        last = state["rendered"] or (0, 0)
-        if (abs(state["size"][0] - last[0]) >= 16
-                or abs(state["size"][1] - last[1]) >= 16):
-            render()
+        visible = visible_variants()
+        aspect = next((v.get("preview_aspect") for v in visible
+                       if v.get("preview_aspect")), 16 / 9.0)
+        if any(caption_shown(v) for v in visible):
+            box_h -= 22
+        width = int(max(XCHECK_THUMB_MIN_W,
+                        min(box_w - 4, (box_h - 4) * aspect)))
+        if abs(width - state["thumb_w"]) > 3:
+            state["thumb_w"] = width
+            set_thumbs()
+
+    def on_resize(_ev=None):
+        kick_fit()
 
     def visible_variants():
         variants = current()["variants"]
@@ -5134,13 +5156,16 @@ def xcheck_picker(project, conflicts, ctx):
         pass
     for widget, events in (("XPAuto", ("Toggled",)),
                            ("XPPump", ("TextEdited", "EditingFinished",
-                                       "ReturnPressed"))):
+                                       "ReturnPressed")),
+                           ("XPFitPump", ("TextEdited", "EditingFinished",
+                                          "ReturnPressed"))):
         for event_name in events:
             try:
                 setattr(getattr(dlg.On, widget), event_name, _noop)
             except Exception:
                 pass
     dlg.On.XPPump.TextChanged = guard(on_pump)
+    dlg.On.XPFitPump.TextChanged = guard(on_fit)
     dlg.On.XCPickerDlg.Resize = guard(on_resize)
 
     for slot in range(XCHECK_CARD_SLOTS):
